@@ -4,30 +4,71 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Subway Blocks — Three.js</title>
-    <link rel="stylesheet" href="/src/style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./src/style.css" />
   </head>
   <body>
     <div id="start-screen">
       <div class="start-card">
         <h1 class="start-title">Subway Blocks</h1>
-        <p class="start-lead">Tap Play to load music and sounds. The game starts after everything is ready.</p>
+        <p class="start-lead">
+          Tap Play once: the 3D world and audio load together, then the game starts. This avoids mobile browser stutter from
+          starting WebGL before you&rsquo;re ready.
+        </p>
         <p id="start-status" class="start-status" aria-live="polite"></p>
         <button type="button" id="start-btn">Play</button>
       </div>
     </div>
     <div id="ui">
       <div id="hud">
-        <span id="score">0</span>
-        <span id="speed">spd 12</span>
-        <span id="coins">coins: 0</span>
+        <div class="hud-stack">
+          <div class="hud-pill">
+            <span class="hud-label">meters</span>
+            <span id="hud-meters" class="hud-num">0</span>
+          </div>
+          <div class="hud-pill" id="hud-coins-wrap">
+            <span class="hud-label">coins</span>
+            <span id="hud-coins" class="hud-num">0</span>
+          </div>
+          <div class="hud-pill hud-pill-score">
+            <span class="hud-label">score</span>
+            <span id="hud-score" class="hud-num">0</span>
+            <span class="hud-hint">coins × meters</span>
+          </div>
+        </div>
+        <div id="speed-hud" class="hud-speed">43 km/h</div>
       </div>
       <div id="overlay" class="hidden">
-        <h1>crashed</h1>
-        <p>space / tap to restart</p>
+        <div class="overlay-inner">
+          <h1 class="overlay-title">wipeout</h1>
+          <div id="overlay-stats" class="overlay-stats">
+            <div class="overlay-stat">
+              <span class="overlay-label">meters run</span>
+              <span id="overlay-meters" class="overlay-value">0</span>
+            </div>
+            <div class="overlay-stat">
+              <span class="overlay-label">coins grabbed</span>
+              <span id="overlay-coins" class="overlay-value">0</span>
+            </div>
+            <div class="overlay-stat overlay-stat-score">
+              <span class="overlay-label">final score</span>
+              <span id="overlay-score" class="overlay-value">0</span>
+              <span class="overlay-formula">coins × meters</span>
+            </div>
+          </div>
+          <p class="overlay-retry">space / tap to restart</p>
+        </div>
       </div>
-      <div id="hint">← → arrow keys / A D · hold mouse drag left-right · swipe · tap = jump</div>
+      <div id="hint">
+        ← → or A D · mouse left / center / right for lanes · swipe · click = jump · S or ↓ hold = slide / duck under beams
+      </div>
     </div>
     <canvas id="c"></canvas>
-    <script type="module" src="/src/main.js"></script>
+    <script type="module" src="./src/main.js"></script>
   </body>
 </html>
