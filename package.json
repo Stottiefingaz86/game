@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "soundtouchjs": "^0.3.0",
     "three": "^0.170.0"
   },
   "devDependencies": {

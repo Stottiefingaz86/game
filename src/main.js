@@ -1,7 +1,13 @@
 import * as THREE from 'three';
-import { PitchShifter } from 'soundtouchjs';
 
 const canvas = document.querySelector('#c');
+
+/** Resolves `public/` files on GitHub Pages and local dev (Vite `base: './'`). */
+function publicAsset(path) {
+  const p = path.startsWith('/') ? path.slice(1) : path;
+  const base = import.meta.env.BASE_URL;
+  return base.endsWith('/') ? `${base}${p}` : `${base}/${p}`;
+}
 const scoreEl = document.querySelector('#score');
 const speedEl = document.querySelector('#speed');
 const coinsEl = document.querySelector('#coins');
@@ -51,38 +57,38 @@ let rng = mulberry32(0x9e3779b9);
  * First URL that fetch succeeds wins.
  */
 const BGM_URLS = [
-  '/sounds/BGSOUND.mp3',
-  '/sounds/bgsound.mp3',
-  '/sounds/bgm.mp3',
-  '/sounds/BGM.mp3',
-  '/sounds/bg.mp3',
-  '/sounds/background.mp3',
-  '/sounds/music.mp3',
-  '/sounds/Music.mp3',
-  '/sounds/track.mp3',
-  '/sounds/song.mp3',
-  '/sounds/theme.mp3',
-  '/sounds/loop.mp3',
-  '/sounds/audio.mp3',
-  '/sounds/track.ogg',
-  '/sounds/bgsound.m4a',
-  '/sounds/bgsound.wav',
-  '/sound/bgsound.mp3',
-  '/sound/bgm.mp3',
-  '/sound/music.mp3',
-  '/bgsound/bgsound.mp3',
-  '/bgsound/bgm.mp3',
-  '/bgsound/BGM.mp3',
-  '/bgsound/bg.mp3',
-  '/bgsound/background.mp3',
-  '/bgsound/music.mp3',
-  '/bgsound/Music.mp3',
-  '/bgsound/track.mp3',
-  '/bgsound/song.mp3',
-  '/bgsound/theme.mp3',
-  '/bgsound/loop.mp3',
-  '/bgsound/audio.mp3',
-  '/bgsound/track.ogg',
+  'sounds/BGSOUND.mp3',
+  'sounds/bgsound.mp3',
+  'sounds/bgm.mp3',
+  'sounds/BGM.mp3',
+  'sounds/bg.mp3',
+  'sounds/background.mp3',
+  'sounds/music.mp3',
+  'sounds/Music.mp3',
+  'sounds/track.mp3',
+  'sounds/song.mp3',
+  'sounds/theme.mp3',
+  'sounds/loop.mp3',
+  'sounds/audio.mp3',
+  'sounds/track.ogg',
+  'sounds/bgsound.m4a',
+  'sounds/bgsound.wav',
+  'sound/bgsound.mp3',
+  'sound/bgm.mp3',
+  'sound/music.mp3',
+  'bgsound/bgsound.mp3',
+  'bgsound/bgm.mp3',
+  'bgsound/BGM.mp3',
+  'bgsound/bg.mp3',
+  'bgsound/background.mp3',
+  'bgsound/music.mp3',
+  'bgsound/Music.mp3',
+  'bgsound/track.mp3',
+  'bgsound/song.mp3',
+  'bgsound/theme.mp3',
+  'bgsound/loop.mp3',
+  'bgsound/audio.mp3',
+  'bgsound/track.ogg',
 ];
 let bgmAudio = null;
 let bgmObjectUrl = null;
@@ -95,79 +101,51 @@ const BGM_RATE_MAX = 1.32;
 /** Set in `tick` from the same `distance` used to compute `speed` that frame (boost ignored). */
 let difficultyRampT = 0;
 
-/** Footsteps / run loop + jump / land (place files in `public/sounds/`). */
-const SFX_RUN = '/sounds/run.mp3';
-const SFX_JUMP = '/sounds/jump.mp3';
-const SFX_LAND = '/sounds/land.mp3';
-const SFX_COIN = '/sounds/coin.mp3';
-const SFX_GAMEOVER = '/sounds/gameover.mp3';
-const SFX_BOOST = '/sounds/boost.mp3';
+/** After a normal jump, play land once when feet touch the ground. */
+let pendingLandSfx = false;
+/** HTML Audio run loop (lightweight vs Web Audio stretch). */
+let runAudio = null;
+/** Throttle expensive per-frame mesh updates. */
+let tickFrame = 0;
 /** Each coin raises playbackRate (higher pitch); capped so it stays usable. */
 const COIN_PITCH_STEP = 0.07;
 const COIN_PITCH_MAX_RATE = 2.35;
-/** Run loop via SoundTouch: higher `tempo` without changing `pitch`. */
-const RUN_TEMPO_BASE = 1.32;
-const RUN_TEMPO_EXTRA_MAX = 0.38;
-let sfxAudioCtx = null;
-let runGainNode = null;
-let runShifter = null;
-let runSfxReady = false;
-let runSfxConnected = false;
-/** After a normal jump, play land once when feet touch the ground. */
-let pendingLandSfx = false;
 
-function getSfxAudioContext() {
-  if (!sfxAudioCtx) {
-    sfxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    runGainNode = sfxAudioCtx.createGain();
-    runGainNode.gain.value = 0.34;
-    runGainNode.connect(sfxAudioCtx.destination);
-  }
-  return sfxAudioCtx;
-}
-
-function initRunSfxWebAudio() {
-  fetch(SFX_RUN)
-    .then((res) => {
-      if (!res.ok) throw new Error('run.mp3 missing');
-      return res.arrayBuffer();
-    })
-    .then((buf) => getSfxAudioContext().decodeAudioData(buf.slice(0)))
-    .then((audioBuffer) => {
-      const ctx = getSfxAudioContext();
-      let shifterRef;
-      const onLoop = () => {
-        if (shifterRef) shifterRef.percentagePlayed = 0;
-      };
-      shifterRef = new PitchShifter(ctx, audioBuffer, 4096, onLoop);
-      shifterRef.pitch = 1;
-      shifterRef.tempo = RUN_TEMPO_BASE;
-      runShifter = shifterRef;
-      runSfxReady = true;
-    })
-    .catch(() => {
-      runSfxReady = false;
-      runShifter = null;
-    });
+function initRunSfx() {
+  const r = new Audio(publicAsset('sounds/run.mp3'));
+  r.loop = true;
+  r.preload = 'auto';
+  r.volume = 0.32;
+  r.addEventListener(
+    'canplaythrough',
+    () => {
+      runAudio = r;
+    },
+    { once: true },
+  );
+  r.addEventListener('error', () => {
+    runAudio = null;
+  });
+  r.load();
 }
 
 function playJumpSfx() {
   if (!bgmUnlocked) return;
-  const a = new Audio(SFX_JUMP);
+  const a = new Audio(publicAsset('sounds/jump.mp3'));
   a.volume = 0.55;
   a.play().catch(() => {});
 }
 
 function playLandSfx() {
   if (!bgmUnlocked) return;
-  const a = new Audio(SFX_LAND);
+  const a = new Audio(publicAsset('sounds/land.mp3'));
   a.volume = 0.48;
   a.play().catch(() => {});
 }
 
 function playCoinSfx(totalCoins) {
   if (!bgmUnlocked) return;
-  const a = new Audio(SFX_COIN);
+  const a = new Audio(publicAsset('sounds/coin.mp3'));
   a.volume = 0.52;
   const n = Math.max(1, totalCoins);
   a.playbackRate = Math.min(COIN_PITCH_MAX_RATE, 1 + (n - 1) * COIN_PITCH_STEP);
@@ -176,47 +154,30 @@ function playCoinSfx(totalCoins) {
 
 function playBoostSfx() {
   if (!bgmUnlocked) return;
-  const a = new Audio(SFX_BOOST);
+  const a = new Audio(publicAsset('sounds/boost.mp3'));
   a.volume = 0.58;
   a.play().catch(() => {});
 }
 
 function playGameOverSfx() {
   if (!bgmUnlocked) return;
-  const a = new Audio(SFX_GAMEOVER);
+  const a = new Audio(publicAsset('sounds/gameover.mp3'));
   a.volume = 0.62;
   a.play().catch(() => {});
 }
 
 function updateRunSfx() {
-  if (!runSfxReady || !runShifter || !runGainNode || !bgmUnlocked) return;
+  if (!runAudio || !bgmUnlocked) return;
   if (!alive) {
-    if (runSfxConnected) {
-      try {
-        runShifter.disconnect();
-      } catch {
-        /* noop */
-      }
-      runSfxConnected = false;
-    }
+    if (!runAudio.paused) runAudio.pause();
     return;
   }
   const grounded = playerY < 0.02;
   if (grounded) {
-    runShifter.pitch = 1;
-    runShifter.tempo = RUN_TEMPO_BASE + difficultyRampT * RUN_TEMPO_EXTRA_MAX;
-    if (!runSfxConnected) {
-      runShifter.connect(runGainNode);
-      runSfxConnected = true;
-    }
-    sfxAudioCtx.resume().catch(() => {});
-  } else if (runSfxConnected) {
-    try {
-      runShifter.disconnect();
-    } catch {
-      /* noop */
-    }
-    runSfxConnected = false;
+    if (runAudio.paused) runAudio.play().catch(() => {});
+    runAudio.playbackRate = THREE.MathUtils.clamp(0.92 + difficultyRampT * 0.42, 0.75, 1.5);
+  } else if (!runAudio.paused) {
+    runAudio.pause();
   }
 }
 
@@ -239,7 +200,7 @@ function revokeBgmBlobUrl() {
 
 function setupBgmFromUrl(index) {
   if (index >= BGM_URLS.length) return;
-  const url = BGM_URLS[index];
+  const url = publicAsset(BGM_URLS[index]);
   fetch(url)
     .then((res) => {
       if (!res.ok) throw new Error('bgm 404');
@@ -279,9 +240,7 @@ function initBgm() {
 }
 
 function unlockBgm() {
-  const first = !bgmUnlocked;
   bgmUnlocked = true;
-  if (first) sfxAudioCtx?.resume().catch(() => {});
   syncBgmPlayState();
 }
 
@@ -307,14 +266,15 @@ function mulberry32(a) {
 
 function makeBlockPlayer() {
   const g = new THREE.Group();
-  const matBody = new THREE.MeshStandardMaterial({
+  const matBody = new THREE.MeshPhongMaterial({
     color: 0x4ecdc4,
-    roughness: 0.35,
-    metalness: 0.15,
+    shininess: 35,
+    specular: 0x224444,
   });
-  const matAccent = new THREE.MeshStandardMaterial({
+  const matAccent = new THREE.MeshPhongMaterial({
     color: 0xff6b6b,
-    roughness: 0.4,
+    shininess: 25,
+    specular: 0x442222,
   });
   const torso = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.65, 0.35), matBody);
   torso.position.y = 0.85;
@@ -335,19 +295,21 @@ function makeGroundStripe(z0, length) {
   const g = new THREE.Group();
   g.userData.zStart = z0;
   g.userData.zEnd = z0 + length;
-  const matDark = new THREE.MeshStandardMaterial({
+  const matDark = new THREE.MeshPhongMaterial({
     color: 0x2d3340,
-    roughness: 0.9,
+    shininess: 8,
+    specular: 0x111111,
   });
-  const matRail = new THREE.MeshStandardMaterial({
+  const matRail = new THREE.MeshPhongMaterial({
     color: 0x5c6370,
-    metalness: 0.4,
-    roughness: 0.5,
+    shininess: 40,
+    specular: 0x444444,
   });
-  const matLine = new THREE.MeshStandardMaterial({
+  const matLine = new THREE.MeshPhongMaterial({
     color: 0xf4d35e,
     emissive: 0x332200,
-    emissiveIntensity: 0.25,
+    shininess: 12,
+    specular: 0x222222,
   });
 
   const slab = new THREE.Mesh(
@@ -387,10 +349,10 @@ function spawnObstacle(z) {
 
   if (roll < 0.45) {
     kind = 'train';
-    const mat = new THREE.MeshStandardMaterial({
+    const mat = new THREE.MeshPhongMaterial({
       color: new THREE.Color().setHSL(rng() * 0.08, 0.5, 0.45 + rng() * 0.15),
-      roughness: 0.55,
-      metalness: 0.25,
+      shininess: 28,
+      specular: 0x333333,
     });
     mesh = new THREE.Mesh(
       new THREE.BoxGeometry(LANE_WIDTH * 0.85, 1.35, 3.2),
@@ -399,7 +361,7 @@ function spawnObstacle(z) {
     mesh.position.set(laneX(lane), 0.75, z);
   } else {
     kind = 'low';
-    const mat = new THREE.MeshStandardMaterial({ color: 0x8b4513, roughness: 0.8 });
+    const mat = new THREE.MeshPhongMaterial({ color: 0x8b4513, shininess: 12, specular: 0x221100 });
     mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.75, 0.45, 0.55), mat);
     mesh.position.set(laneX(lane), 0.22, z);
   }
@@ -411,12 +373,11 @@ function spawnObstacle(z) {
 function spawnCoinRow(z) {
   const lane = LANES[Math.floor(rng() * 3)];
   const n = 3 + Math.floor(rng() * 4);
-  const mat = new THREE.MeshStandardMaterial({
+  const mat = new THREE.MeshPhongMaterial({
     color: 0xffd60a,
-    emissive: 0xaa7700,
-    emissiveIntensity: 0.35,
-    roughness: 0.35,
-    metalness: 0.5,
+    emissive: 0x553300,
+    shininess: 60,
+    specular: 0xffffaa,
   });
   for (let i = 0; i < n; i++) {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.35, 0.12), mat);
@@ -435,19 +396,17 @@ function spawnBoostPad(z) {
   const d = 1.4;
   const stripD = d / 5;
   const h = 0.09;
-  const matA = new THREE.MeshStandardMaterial({
+  const matA = new THREE.MeshPhongMaterial({
     color: 0x00e5c8,
-    emissive: 0x006658,
-    emissiveIntensity: 0.55,
-    metalness: 0.35,
-    roughness: 0.32,
+    emissive: 0x004433,
+    shininess: 45,
+    specular: 0x88ffee,
   });
-  const matB = new THREE.MeshStandardMaterial({
+  const matB = new THREE.MeshPhongMaterial({
     color: 0xff2d95,
-    emissive: 0x660033,
-    emissiveIntensity: 0.5,
-    metalness: 0.3,
-    roughness: 0.38,
+    emissive: 0x440022,
+    shininess: 40,
+    specular: 0xff88cc,
   });
   for (let i = 0; i < 5; i++) {
     const strip = new THREE.Mesh(
@@ -473,18 +432,24 @@ function init() {
   camera.position.set(0, 4.2, -6.5);
   camera.lookAt(0, 0.8, 10);
 
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: false,
+    powerPreference: 'high-performance',
+    stencil: false,
+    depth: true,
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = THREE.BasicShadowMap;
 
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 0.85);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 0.9);
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xfff5e6, 1.1);
+  const sun = new THREE.DirectionalLight(0xfff5e6, 1.05);
   sun.position.set(8, 18, 10);
   sun.castShadow = true;
-  sun.shadow.mapSize.setScalar(2048);
+  sun.shadow.mapSize.setScalar(1024);
   sun.shadow.camera.near = 0.5;
   sun.shadow.camera.far = 80;
   sun.shadow.camera.left = -20;
@@ -497,7 +462,7 @@ function init() {
   scene.add(worldGroup);
 
   let zEnd = 0;
-  for (let i = 0; i < 8; i++) zEnd = spawnChunk(zEnd);
+  for (let i = 0; i < 6; i++) zEnd = spawnChunk(zEnd);
 
   playerGroup = makeBlockPlayer();
   playerGroup.position.set(0, 0, 0);
@@ -526,7 +491,7 @@ function init() {
   overlay.addEventListener('click', restart);
 
   initBgm();
-  initRunSfxWebAudio();
+  initRunSfx();
 }
 
 function onResize() {
@@ -661,7 +626,7 @@ function restart() {
 
   while (worldGroup.children.length) worldGroup.remove(worldGroup.children[0]);
   let zEnd = 0;
-  for (let i = 0; i < 8; i++) zEnd = spawnChunk(zEnd);
+  for (let i = 0; i < 6; i++) zEnd = spawnChunk(zEnd);
 
   scoreEl.textContent = '0';
   speedEl.textContent = `spd ${Math.round(baseSpeed)}`;
@@ -669,14 +634,7 @@ function restart() {
   if (bgmAudio) bgmAudio.playbackRate = BGM_RATE_MIN;
   pendingLandSfx = false;
   difficultyRampT = 0;
-  if (runSfxConnected && runShifter) {
-    try {
-      runShifter.disconnect();
-    } catch {
-      /* noop */
-    }
-    runSfxConnected = false;
-  }
+  if (runAudio) runAudio.pause();
 }
 
 function playerXZRect() {
@@ -714,6 +672,8 @@ function overlapsObstacle(rect, o) {
 
 function tick(dt) {
   if (!alive) return;
+
+  tickFrame += 1;
 
   const speedBonus = Math.min(SPEED_MAX_BONUS, distance * SPEED_RAMP_PER_UNIT);
   difficultyRampT = SPEED_MAX_BONUS > 0 ? speedBonus / SPEED_MAX_BONUS : 0;
@@ -848,20 +808,22 @@ function tick(dt) {
   }
 
   for (const c of coins) {
-    if (!c.collected) c.mesh.rotation.y += dt * 2.5;
+    if (!c.collected && (tickFrame & 1) === 0) c.mesh.rotation.y += dt * 5;
   }
 
-  for (const pad of boostPads) {
-    if (pad.used) continue;
-    pad.pulse += dt * 4;
-    let idx = 0;
-    pad.mesh.traverse((o) => {
-      if (o.isMesh && o.material && o.material.emissiveIntensity != null) {
-        const base = idx % 2 === 0 ? 0.55 : 0.5;
-        o.material.emissiveIntensity = base + Math.sin(pad.pulse + idx * 0.7) * 0.18;
-        idx += 1;
-      }
-    });
+  if ((tickFrame & 1) === 0) {
+    for (const pad of boostPads) {
+      if (pad.used) continue;
+      pad.pulse += dt * 8;
+      let idx = 0;
+      pad.mesh.traverse((o) => {
+        if (o.isMesh && o.material && 'emissiveIntensity' in o.material) {
+          const base = idx % 2 === 0 ? 0.55 : 0.5;
+          o.material.emissiveIntensity = base + Math.sin(pad.pulse + idx * 0.7) * 0.18;
+          idx += 1;
+        }
+      });
+    }
   }
 }
 
