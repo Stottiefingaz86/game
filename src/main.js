@@ -12,12 +12,26 @@ const scoreEl = document.querySelector('#score');
 const speedEl = document.querySelector('#speed');
 const coinsEl = document.querySelector('#coins');
 const overlay = document.querySelector('#overlay');
+const startScreenEl = document.getElementById('start-screen');
+const startBtnEl = document.getElementById('start-btn');
+const startStatusEl = document.getElementById('start-status');
 
 const LANE_WIDTH = 2.2;
 const LANES = [-1, 0, 1];
 const laneX = (i) => i * LANE_WIDTH;
 
+/** Touch phones/tablets: fewer pixels + no shadow pass (biggest WebGL wins on weak GPUs). */
+function preferMobilePerf() {
+  const coarse =
+    typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  const uaMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  return coarse || uaMobile;
+}
+
 let scene, camera, renderer;
+/** Set in init: skip shadow map + tune resolution. */
+let mobilePerf = false;
 let playerGroup;
 let worldGroup;
 let speed = 12;
@@ -28,6 +42,8 @@ const SPEED_MAX_BONUS = 36;
 let distance = 0;
 let coinCount = 0;
 let alive = true;
+/** False until Play preloads audio and unlocks the run (fixes prod / autoplay / stutter). */
+let gameStarted = false;
 let pointerDownX = 0;
 let pointerDownY = 0;
 let activePointerId = null;
@@ -105,69 +121,134 @@ let difficultyRampT = 0;
 let pendingLandSfx = false;
 /** HTML Audio run loop (lightweight vs Web Audio stretch). */
 let runAudio = null;
+/** Blob URLs for one-shots (preloaded on start screen). */
+let sfxObjectUrls = {};
+/** Rotate through clips so rapid coin pickups do not cancel each other. */
+let coinAudioPool = [];
+let coinPoolIdx = 0;
 /** Throttle expensive per-frame mesh updates. */
 let tickFrame = 0;
 /** Each coin raises playbackRate (higher pitch); capped so it stays usable. */
 const COIN_PITCH_STEP = 0.07;
 const COIN_PITCH_MAX_RATE = 2.35;
 
-function initRunSfx() {
-  const r = new Audio(publicAsset('sounds/run.mp3'));
-  r.loop = true;
-  r.preload = 'auto';
-  r.volume = 0.32;
-  r.addEventListener(
-    'canplaythrough',
-    () => {
-      runAudio = r;
-    },
-    { once: true },
-  );
-  r.addEventListener('error', () => {
-    runAudio = null;
+const SFX_PRELOAD_PATHS = {
+  run: 'sounds/run.mp3',
+  jump: 'sounds/jump.mp3',
+  land: 'sounds/land.mp3',
+  coin: 'sounds/coin.mp3',
+  boost: 'sounds/boost.mp3',
+  gameover: 'sounds/gameover.mp3',
+};
+
+function waitAudioElementReady(audioEl) {
+  return new Promise((resolve) => {
+    const done = () => resolve();
+    if (audioEl.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+      done();
+      return;
+    }
+    audioEl.addEventListener('canplaythrough', done, { once: true });
+    audioEl.addEventListener('error', done, { once: true });
+    try {
+      audioEl.load();
+    } catch {
+      done();
+    }
   });
-  r.load();
+}
+
+async function fetchFirstWorkingBgmBlob() {
+  for (const rel of BGM_URLS) {
+    try {
+      const r = await fetch(publicAsset(rel));
+      if (!r.ok) continue;
+      const ct = r.headers.get('content-type');
+      if (ct && ct.includes('text/html')) continue;
+      return await r.blob();
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+function revokeAllSfxObjectUrls() {
+  for (const u of Object.values(sfxObjectUrls)) {
+    if (u) URL.revokeObjectURL(u);
+  }
+  sfxObjectUrls = {};
+}
+
+async function fetchAllSfxObjectUrls() {
+  const out = {};
+  await Promise.all(
+    Object.entries(SFX_PRELOAD_PATHS).map(async ([key, path]) => {
+      try {
+        const r = await fetch(publicAsset(path));
+        if (!r.ok) return;
+        const ct = r.headers.get('content-type');
+        if (ct && ct.includes('text/html')) return;
+        out[key] = URL.createObjectURL(await r.blob());
+      } catch {
+        /* skip */
+      }
+    }),
+  );
+  return out;
+}
+
+function initCoinAudioPool() {
+  coinAudioPool = [];
+  coinPoolIdx = 0;
+  const url = sfxObjectUrls.coin;
+  if (!url) return;
+  for (let i = 0; i < 4; i += 1) {
+    const a = new Audio(url);
+    a.preload = 'auto';
+    a.volume = 0.52;
+    coinAudioPool.push(a);
+  }
+}
+
+function playOneShotFromCache(key, volume, playbackRate = 1) {
+  if (!bgmUnlocked || !sfxObjectUrls[key]) return;
+  const a = new Audio(sfxObjectUrls[key]);
+  a.volume = volume;
+  a.playbackRate = playbackRate;
+  a.play().catch(() => {});
 }
 
 function playJumpSfx() {
-  if (!bgmUnlocked) return;
-  const a = new Audio(publicAsset('sounds/jump.mp3'));
-  a.volume = 0.55;
-  a.play().catch(() => {});
+  playOneShotFromCache('jump', 0.55);
 }
 
 function playLandSfx() {
-  if (!bgmUnlocked) return;
-  const a = new Audio(publicAsset('sounds/land.mp3'));
-  a.volume = 0.48;
-  a.play().catch(() => {});
+  playOneShotFromCache('land', 0.48);
 }
 
 function playCoinSfx(totalCoins) {
-  if (!bgmUnlocked) return;
-  const a = new Audio(publicAsset('sounds/coin.mp3'));
-  a.volume = 0.52;
+  if (!bgmUnlocked || coinAudioPool.length === 0) return;
   const n = Math.max(1, totalCoins);
-  a.playbackRate = Math.min(COIN_PITCH_MAX_RATE, 1 + (n - 1) * COIN_PITCH_STEP);
+  const rate = Math.min(COIN_PITCH_MAX_RATE, 1 + (n - 1) * COIN_PITCH_STEP);
+  const a = coinAudioPool[coinPoolIdx % coinAudioPool.length];
+  coinPoolIdx += 1;
+  a.pause();
+  a.currentTime = 0;
+  a.playbackRate = rate;
   a.play().catch(() => {});
 }
 
 function playBoostSfx() {
-  if (!bgmUnlocked) return;
-  const a = new Audio(publicAsset('sounds/boost.mp3'));
-  a.volume = 0.58;
-  a.play().catch(() => {});
+  playOneShotFromCache('boost', 0.58);
 }
 
 function playGameOverSfx() {
-  if (!bgmUnlocked) return;
-  const a = new Audio(publicAsset('sounds/gameover.mp3'));
-  a.volume = 0.62;
-  a.play().catch(() => {});
+  playOneShotFromCache('gameover', 0.62);
 }
 
 function updateRunSfx() {
-  if (!runAudio || !bgmUnlocked) return;
+  if (!gameStarted || !runAudio || !bgmUnlocked) return;
   if (!alive) {
     if (!runAudio.paused) runAudio.pause();
     return;
@@ -182,7 +263,7 @@ function updateRunSfx() {
 }
 
 function syncBgmPlayState() {
-  if (!bgmAudio || !bgmUnlocked) return;
+  if (!gameStarted || !bgmAudio || !bgmUnlocked) return;
   if (!alive) {
     bgmAudio.pause();
     return;
@@ -198,54 +279,13 @@ function revokeBgmBlobUrl() {
   }
 }
 
-function setupBgmFromUrl(index) {
-  if (index >= BGM_URLS.length) return;
-  const url = publicAsset(BGM_URLS[index]);
-  fetch(url)
-    .then((res) => {
-      if (!res.ok) throw new Error('bgm 404');
-      return res.blob();
-    })
-    .then((blob) => {
-      revokeBgmBlobUrl();
-      bgmObjectUrl = URL.createObjectURL(blob);
-      const a = new Audio(bgmObjectUrl);
-      a.preload = 'auto';
-      a.loop = true;
-      a.volume = BGM_VOLUME;
-      const onReady = () => {
-        bgmAudio = a;
-        syncBgmPlayState();
-      };
-      a.addEventListener('canplay', onReady, { once: true });
-      a.addEventListener('canplaythrough', onReady, { once: true });
-      a.addEventListener(
-        'error',
-        () => {
-          revokeBgmBlobUrl();
-          if (bgmAudio === a) bgmAudio = null;
-          setupBgmFromUrl(index + 1);
-        },
-        { once: true },
-      );
-      a.load();
-    })
-    .catch(() => {
-      setupBgmFromUrl(index + 1);
-    });
-}
-
-function initBgm() {
-  setupBgmFromUrl(0);
-}
-
 function unlockBgm() {
   bgmUnlocked = true;
   syncBgmPlayState();
 }
 
 function updateBgmPlayback() {
-  if (!bgmAudio || !bgmUnlocked) return;
+  if (!gameStarted || !bgmAudio || !bgmUnlocked) return;
   if (!alive) {
     if (!bgmAudio.paused) bgmAudio.pause();
     return;
@@ -414,7 +454,7 @@ function spawnBoostPad(z) {
       i % 2 === 0 ? matA : matB,
     );
     strip.position.set(0, h / 2 + 0.02, -d / 2 + stripD / 2 + i * stripD);
-    strip.receiveShadow = true;
+    strip.receiveShadow = !mobilePerf;
     g.add(strip);
   }
   g.position.set(laneX(lane), 0, z);
@@ -432,6 +472,8 @@ function init() {
   camera.position.set(0, 4.2, -6.5);
   camera.lookAt(0, 0.8, 10);
 
+  mobilePerf = preferMobilePerf();
+
   renderer = new THREE.WebGLRenderer({
     canvas,
     antialias: false,
@@ -439,23 +481,28 @@ function init() {
     stencil: false,
     depth: true,
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  const pixelRatio = mobilePerf
+    ? Math.min(window.devicePixelRatio, 1)
+    : Math.min(window.devicePixelRatio, 1.5);
+  renderer.setPixelRatio(pixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.enabled = !mobilePerf;
   renderer.shadowMap.type = THREE.BasicShadowMap;
 
   const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 0.9);
   scene.add(hemi);
   const sun = new THREE.DirectionalLight(0xfff5e6, 1.05);
   sun.position.set(8, 18, 10);
-  sun.castShadow = true;
-  sun.shadow.mapSize.setScalar(1024);
-  sun.shadow.camera.near = 0.5;
-  sun.shadow.camera.far = 80;
-  sun.shadow.camera.left = -20;
-  sun.shadow.camera.right = 20;
-  sun.shadow.camera.top = 25;
-  sun.shadow.camera.bottom = -5;
+  sun.castShadow = !mobilePerf;
+  if (!mobilePerf) {
+    sun.shadow.mapSize.setScalar(1024);
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 80;
+    sun.shadow.camera.left = -20;
+    sun.shadow.camera.right = 20;
+    sun.shadow.camera.top = 25;
+    sun.shadow.camera.bottom = -5;
+  }
   scene.add(sun);
 
   worldGroup = new THREE.Group();
@@ -466,11 +513,11 @@ function init() {
 
   playerGroup = makeBlockPlayer();
   playerGroup.position.set(0, 0, 0);
-  playerGroup.castShadow = true;
+  playerGroup.castShadow = !mobilePerf;
   playerGroup.traverse((o) => {
     if (o.isMesh) {
-      o.castShadow = true;
-      o.receiveShadow = true;
+      o.castShadow = !mobilePerf;
+      o.receiveShadow = !mobilePerf;
     }
   });
   scene.add(playerGroup);
@@ -490,8 +537,9 @@ function init() {
 
   overlay.addEventListener('click', restart);
 
-  initBgm();
-  initRunSfx();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && gameStarted && alive) syncBgmPlayState();
+  });
 }
 
 function onResize() {
@@ -516,6 +564,7 @@ function shiftLane(dir) {
 }
 
 function onKeyDown(e) {
+  if (!gameStarted) return;
   unlockBgm();
   // Screen-left / screen-right match world X when camera is behind the runner (+Z forward).
   if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
@@ -538,6 +587,7 @@ function onKeyDown(e) {
 const MOUSE_DRAG_LANE_PX = 95;
 
 function onPointerDown(e) {
+  if (!gameStarted) return;
   if (e.isPrimary === false) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   unlockBgm();
@@ -555,7 +605,7 @@ function onPointerDown(e) {
 }
 
 function onPointerMove(e) {
-  if (!alive) return;
+  if (!gameStarted || !alive) return;
   if (e.pointerType !== 'mouse') return;
   if (!(e.buttons & 1)) return;
   if (activePointerId == null || e.pointerId !== activePointerId) return;
@@ -572,6 +622,7 @@ function onPointerMove(e) {
 }
 
 function onPointerUp(e) {
+  if (!gameStarted) return;
   if (activePointerId == null || e.pointerId !== activePointerId) return;
   activePointerId = null;
   try {
@@ -671,7 +722,7 @@ function overlapsObstacle(rect, o) {
 }
 
 function tick(dt) {
-  if (!alive) return;
+  if (!gameStarted || !alive) return;
 
   tickFrame += 1;
 
@@ -838,6 +889,57 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
+function wireStartScreen() {
+  if (!startBtnEl || !startScreenEl) return;
+  startBtnEl.addEventListener('click', async () => {
+    if (gameStarted) return;
+    startBtnEl.disabled = true;
+    if (startStatusEl) startStatusEl.textContent = 'Loading music…';
+    try {
+      const bgmBlob = await fetchFirstWorkingBgmBlob();
+      if (startStatusEl) startStatusEl.textContent = 'Loading sound effects…';
+      revokeAllSfxObjectUrls();
+      sfxObjectUrls = await fetchAllSfxObjectUrls();
+      revokeBgmBlobUrl();
+      bgmAudio = null;
+      if (bgmBlob) {
+        bgmObjectUrl = URL.createObjectURL(bgmBlob);
+        const a = new Audio(bgmObjectUrl);
+        a.preload = 'auto';
+        a.loop = true;
+        a.volume = BGM_VOLUME;
+        await waitAudioElementReady(a);
+        if (a.error) {
+          revokeBgmBlobUrl();
+        } else {
+          bgmAudio = a;
+        }
+      }
+      runAudio = null;
+      const runUrl = sfxObjectUrls.run;
+      if (runUrl) {
+        const r = new Audio(runUrl);
+        r.loop = true;
+        r.preload = 'auto';
+        r.volume = 0.32;
+        await waitAudioElementReady(r);
+        if (!r.error) runAudio = r;
+      }
+      initCoinAudioPool();
+      gameStarted = true;
+      unlockBgm();
+      startScreenEl.classList.add('hidden');
+      if (startStatusEl) startStatusEl.textContent = '';
+    } catch {
+      if (startStatusEl) {
+        startStatusEl.textContent = 'Could not load audio. Check your connection and tap Play again.';
+      }
+      startBtnEl.disabled = false;
+    }
+  });
+}
+
 init();
 onResize();
+wireStartScreen();
 requestAnimationFrame(loop);

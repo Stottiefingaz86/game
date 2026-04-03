@@ -13,6 +13,75 @@ body {
   font-family: system-ui, sans-serif;
 }
 
+#start-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: radial-gradient(ellipse at 50% 20%, #2a3344 0%, #12151c 55%, #0a0c10 100%);
+  pointer-events: auto;
+}
+
+#start-screen.hidden {
+  display: none;
+}
+
+.start-card {
+  max-width: 22rem;
+  text-align: center;
+  color: #e8eaef;
+}
+
+.start-title {
+  font-size: clamp(1.75rem, 5vw, 2.25rem);
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 0.75rem;
+  color: #f5f5f5;
+}
+
+.start-lead {
+  font-size: 0.95rem;
+  line-height: 1.45;
+  color: #9aa3b2;
+  margin-bottom: 1rem;
+}
+
+.start-status {
+  min-height: 1.25rem;
+  font-size: 0.85rem;
+  color: #7ee787;
+  margin-bottom: 1rem;
+}
+
+#start-btn {
+  appearance: none;
+  border: none;
+  border-radius: 0.5rem;
+  padding: 0.75rem 2.25rem;
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  background: linear-gradient(180deg, #4ecdc4 0%, #2a9d8f 100%);
+  color: #0d1117;
+  box-shadow: 0 4px 14px rgba(78, 205, 196, 0.35);
+}
+
+#start-btn:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+#start-btn:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
 #c {
   display: block;
   width: 100%;
