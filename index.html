@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Subway Blocks — Three.js</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="ui">
+      <div id="hud">
+        <span id="score">0</span>
+        <span id="speed">spd 12</span>
+        <span id="coins">coins: 0</span>
+      </div>
+      <div id="overlay" class="hidden">
+        <h1>crashed</h1>
+        <p>space / tap to restart</p>
+      </div>
+      <div id="hint">← → arrow keys / A D · hold mouse drag left-right · swipe · tap = jump</div>
+    </div>
+    <canvas id="c"></canvas>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
