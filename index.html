@@ -60,11 +60,14 @@
       <div class="start-instructions-panel">
         <h2 id="start-instructions-heading" class="start-instructions-heading">How to play</h2>
         <ul class="start-instructions-list">
-          <li><strong>Lanes:</strong> ← → or A D · mouse left / center / right · on phone: ◀ ▶ buttons</li>
-          <li><strong>Jump:</strong> space / up / W · click / tap · on phone: Jump button</li>
           <li>
-            <strong>Backward:</strong> S or ↓ · on phone hold <strong>Back</strong> (max 10 m behind best
-            distance; release to run forward)
+            <strong>Lanes:</strong> ← → or A D · mouse left / center / right · on phone: drag or swipe left/right on
+            the game
+          </li>
+          <li><strong>Jump:</strong> space / up / W · click / tap the game (not the HUD)</li>
+          <li>
+            <strong>Backward:</strong> S or ↓ · on phone: while touching the game, drag mostly downward (hold) — max
+            10 m behind best distance; release to run forward
           </li>
           <li><strong>Duck:</strong> auto while holding backward on the ground — slip under low beams</li>
           <li><strong>Score:</strong> coins × meters</li>
@@ -113,26 +116,6 @@
           </div>
           <p class="overlay-retry">Tap anywhere or press space to restart</p>
         </div>
-      </div>
-      <div
-        id="mobile-controls"
-        class="mobile-controls"
-        aria-hidden="true"
-      >
-        <button type="button" class="mobile-ctrl mobile-ctrl--lane" id="mobile-lane-left" aria-label="Move left">
-          ◀
-        </button>
-        <div class="mobile-ctrl-stack">
-          <button type="button" class="mobile-ctrl mobile-ctrl--jump" id="mobile-jump" aria-label="Jump">
-            Jump
-          </button>
-          <button type="button" class="mobile-ctrl mobile-ctrl--back" id="mobile-back" aria-label="Hold to run backward">
-            Back
-          </button>
-        </div>
-        <button type="button" class="mobile-ctrl mobile-ctrl--lane" id="mobile-lane-right" aria-label="Move right">
-          ▶
-        </button>
       </div>
     </div>
     <canvas id="c"></canvas>

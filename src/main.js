@@ -6,6 +6,9 @@ import { clone as cloneSkinnedModel, retargetClip } from 'three/addons/utils/Ske
 
 const canvas = document.querySelector('#c');
 
+/** Cached `index.html` on CDNs/phones may still contain the old dock; new JS removes it. */
+document.getElementById('mobile-controls')?.remove();
+
 /** Hide OS cursor during a run; show large pointer on start + game-over UI only. */
 function syncPlayCursor() {
   if (typeof document === 'undefined' || !document.body) return;
@@ -18,71 +21,6 @@ function syncPlayCursor() {
     (overlay && !overlay.classList.contains('hidden'));
   document.body.classList.toggle('game-running', inActiveRun);
   document.body.classList.toggle('menu-cursor', menuCursor);
-  const mobileControlsEl = document.getElementById('mobile-controls');
-  if (mobileControlsEl && document.body.classList.contains('mobile-touch-ui')) {
-    mobileControlsEl.setAttribute('aria-hidden', inActiveRun ? 'false' : 'true');
-  }
-}
-
-function wireMobileTouchControls() {
-  const left = document.getElementById('mobile-lane-left');
-  const right = document.getElementById('mobile-lane-right');
-  const jump = document.getElementById('mobile-jump');
-  const back = document.getElementById('mobile-back');
-  const absorb = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-  left?.addEventListener('pointerdown', (e) => {
-    absorb(e);
-    syncTouchGestureAudioUnlock();
-    try {
-      canvas.focus({ preventScroll: true });
-    } catch {
-      /* ignore */
-    }
-    unlockBgm();
-    if (!alive || !runGameplayActive) return;
-    shiftLaneFromInput(1);
-  });
-  right?.addEventListener('pointerdown', (e) => {
-    absorb(e);
-    syncTouchGestureAudioUnlock();
-    try {
-      canvas.focus({ preventScroll: true });
-    } catch {
-      /* ignore */
-    }
-    unlockBgm();
-    if (!alive || !runGameplayActive) return;
-    shiftLaneFromInput(-1);
-  });
-  jump?.addEventListener('pointerdown', (e) => {
-    absorb(e);
-    syncTouchGestureAudioUnlock();
-    unlockBgm();
-    if (!gameStarted) return;
-    if (!alive) {
-      restart();
-      return;
-    }
-    tryJump();
-  });
-  const backDown = (e) => {
-    absorb(e);
-    syncTouchGestureAudioUnlock();
-    unlockBgm();
-    if (!gameStarted || !alive || !runGameplayActive) return;
-    runBackwardHeld = true;
-  };
-  const backUp = () => {
-    runBackwardHeld = false;
-  };
-  back?.addEventListener('pointerdown', backDown);
-  back?.addEventListener('pointerup', backUp);
-  back?.addEventListener('pointerleave', backUp);
-  back?.addEventListener('pointercancel', backUp);
-  back?.addEventListener('lostpointercapture', backUp);
 }
 
 function closeStartInstructionsModal() {
@@ -278,21 +216,6 @@ function preferMobilePerf() {
   return narrow && (coarse || maxTouch > 0);
 }
 
-/**
- * On-screen ◀ Jump ▶: only phones/tablets and touch-primary narrow layouts.
- * Desktop touchscreens (narrow window + maxTouch) must not get this — keyboard/mouse stay primary.
- */
-function preferMobileOnScreenControls() {
-  if (typeof window === 'undefined') return false;
-  const ua = navigator.userAgent || '';
-  if (/Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua)) return true;
-  const narrow =
-    typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 900px)').matches;
-  const coarse =
-    typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
-  return narrow && coarse;
-}
-
 /** iPhone / iPod: tight GPU memory and fragile WebGL precompile; treat differently from iPad. */
 function isIPhoneOrIPod() {
   return /iPhone|iPod/.test(navigator.userAgent || '');
@@ -476,6 +399,10 @@ let mouseLaneAccum = 0;
 let didDragLaneChange = false;
 /** Previous `clientX` during a touch drag; `movementX` is unreliable on mobile. */
 let lastTouchLaneX = 0;
+/** Touch: drag mostly downward from stroke start = run backward (no on-screen Back button). */
+let touchBackwardHeld = false;
+/** True if this stroke ever entered backward-drag; suppresses tap-to-jump on release. */
+let touchStrokeUsedBackward = false;
 
 let playerLane = 0;
 let targetLaneX = 0;
@@ -1095,7 +1022,7 @@ function playGameOverSfx() {
 }
 
 function isRunningBackward() {
-  return runBackwardHeld && alive && runGameplayActive;
+  return (runBackwardHeld || touchBackwardHeld) && alive && runGameplayActive;
 }
 
 function updateRunSfx(dt) {
@@ -4152,9 +4079,8 @@ function init() {
 
   overlay?.addEventListener('click', restart);
 
-  if (preferMobileOnScreenControls()) {
-    document.body.classList.add('mobile-touch-ui');
-    wireMobileTouchControls();
+  if (mobilePerf) {
+    document.body.classList.add('mobile-perf-hud');
   }
   if (mobilePerf) {
     const kickMobileAudio = () => {
@@ -4295,6 +4221,8 @@ function onPointerDown(e) {
   activePointerId = e.pointerId;
   mouseLaneAccum = 0;
   didDragLaneChange = false;
+  touchBackwardHeld = false;
+  touchStrokeUsedBackward = false;
   canvas.focus({ preventScroll: true });
   try {
     canvas.setPointerCapture(e.pointerId);
@@ -4328,12 +4256,24 @@ function onPointerMove(e) {
     mouseLaneAccum = 0;
     didDragLaneChange = true;
   }
+
+  const tdx = e.clientX - pointerDownX;
+  const tdy = e.clientY - pointerDownY;
+  const TOUCH_BACKWARD_DRAG_PX = 40;
+  if (tdy > TOUCH_BACKWARD_DRAG_PX && tdy > Math.abs(tdx) * 0.65) {
+    touchBackwardHeld = true;
+    touchStrokeUsedBackward = true;
+  } else {
+    touchBackwardHeld = false;
+  }
 }
 
 function onPointerUp(e) {
   if (!gameStarted) return;
   if (activePointerId == null || e.pointerId !== activePointerId) return;
   activePointerId = null;
+  touchBackwardHeld = false;
+  const skipTapJump = touchStrokeUsedBackward;
   try {
     canvas.releasePointerCapture(e.pointerId);
   } catch {
@@ -4344,16 +4284,19 @@ function onPointerUp(e) {
   const swipePx = 24;
   if (!didDragLaneChange && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > swipePx) {
     shiftLaneFromInput(dx > 0 ? -1 : 1);
-  } else if (!didDragLaneChange) {
+  } else if (!didDragLaneChange && !skipTapJump) {
     tryJump();
   }
   mouseLaneAccum = 0;
   didDragLaneChange = false;
+  touchStrokeUsedBackward = false;
 }
 
 function onPointerCancel(e) {
   if (activePointerId != null && e.pointerId === activePointerId) {
     activePointerId = null;
+    touchBackwardHeld = false;
+    touchStrokeUsedBackward = false;
     try {
       canvas.releasePointerCapture(e.pointerId);
     } catch {
@@ -4435,6 +4378,8 @@ function restart() {
   if (runAudio) runAudio.pause();
   runBackwardHeld = false;
   runBackwardPrevTick = false;
+  touchBackwardHeld = false;
+  touchStrokeUsedBackward = false;
   duckAmount = 0;
   if (playerGroup) {
     playerGroup.userData.duckAmount = 0;

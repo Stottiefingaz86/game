@@ -724,93 +724,16 @@ body.game-running #hud {
   letter-spacing: 0.03em;
 }
 
-/* On-screen controls: `body.mobile-touch-ui` from JS (mobile UA or narrow + coarse pointer only). */
+/* On-screen ◀ Jump ▶ bar removed on mobile (compositor / layout cost); play on canvas: tap jump, drag/swipe lanes. */
+#mobile-controls,
 .mobile-controls {
-  display: none;
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  z-index: 3;
-  padding: 0.4rem max(0.45rem, env(safe-area-inset-left, 0px)) max(0.55rem, env(safe-area-inset-bottom, 0px))
-    max(0.45rem, env(safe-area-inset-right, 0px));
-  gap: 0.45rem;
-  align-items: stretch;
-  justify-content: space-between;
-  pointer-events: auto;
-  font-family: 'Fredoka', system-ui, sans-serif;
+  display: none !important;
+  visibility: hidden;
+  pointer-events: none;
 }
 
-body.mobile-touch-ui.game-running .mobile-controls {
-  display: flex;
-}
-
-.mobile-ctrl-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  flex: 1;
-  max-width: min(11rem, 38vw);
-  min-width: 0;
-}
-
-.mobile-ctrl {
-  touch-action: manipulation;
-  -webkit-user-select: none;
-  user-select: none;
-  border: none;
-  cursor: pointer;
-  font-family: inherit;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  border-radius: 1rem;
-  color: #fff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
-  box-shadow:
-    0 4px 0 rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  transition:
-    transform 0.06s ease,
-    filter 0.06s ease;
-}
-
-.mobile-ctrl:active {
-  transform: translateY(2px);
-  box-shadow:
-    0 2px 0 rgba(0, 0, 0, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.1);
-}
-
-.mobile-ctrl--lane {
-  flex: 0 0 min(4.5rem, 22vw);
-  min-height: 5.5rem;
-  font-size: clamp(1.35rem, 6vw, 1.85rem);
-  line-height: 1;
-  background: linear-gradient(165deg, rgba(56, 214, 255, 0.55) 0%, rgba(20, 100, 180, 0.75) 100%);
-  border: 2px solid rgba(120, 230, 255, 0.35);
-}
-
-.mobile-ctrl--jump {
-  flex: 1;
-  min-height: 3.15rem;
-  font-size: clamp(0.95rem, 3.8vw, 1.15rem);
-  text-transform: uppercase;
-  background: linear-gradient(165deg, rgba(255, 120, 200, 0.75) 0%, rgba(200, 40, 140, 0.88) 100%);
-  border: 2px solid rgba(255, 180, 220, 0.4);
-}
-
-.mobile-ctrl--back {
-  flex: 0 0 auto;
-  min-height: 2.35rem;
-  font-size: clamp(0.72rem, 3.2vw, 0.88rem);
-  text-transform: uppercase;
-  background: linear-gradient(165deg, rgba(120, 120, 140, 0.65) 0%, rgba(45, 48, 62, 0.9) 100%);
-  border: 2px solid rgba(200, 200, 220, 0.2);
-  color: rgba(255, 255, 255, 0.92);
-}
-
-/* —— Phones / touch-primary: larger HUD, safe areas, frosted control dock —— */
-body.mobile-touch-ui #hud {
+/* Phones / tablets (`mobile-perf-hud` from JS when `mobilePerf`): larger HUD + safe areas. */
+body.mobile-perf-hud #hud {
   top: max(0.5rem, env(safe-area-inset-top, 0px));
   left: 50%;
   right: auto;
@@ -820,11 +743,11 @@ body.mobile-touch-ui #hud {
   padding-right: env(safe-area-inset-right, 0px);
 }
 
-body.mobile-touch-ui .hud-stack {
+body.mobile-perf-hud .hud-stack {
   gap: 0.45rem 0.55rem;
 }
 
-body.mobile-touch-ui .hud-pill {
+body.mobile-perf-hud .hud-pill {
   min-width: 5.85rem;
   padding: 0.42rem 0.95rem 0.48rem;
   border-radius: 1.05rem;
@@ -834,56 +757,24 @@ body.mobile-touch-ui .hud-pill {
     inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
 
-body.mobile-touch-ui .hud-label {
+body.mobile-perf-hud .hud-label {
   font-size: clamp(0.68rem, 2.6vw, 0.8rem);
   letter-spacing: 0.12em;
 }
 
-body.mobile-touch-ui .hud-num {
+body.mobile-perf-hud .hud-num {
   font-size: clamp(1.55rem, 5.2vw, 2.05rem);
 }
 
-body.mobile-touch-ui .hud-pill-score .hud-num {
+body.mobile-perf-hud .hud-pill-score .hud-num {
   font-size: clamp(1.65rem, 5.8vw, 2.2rem);
 }
 
-body.mobile-touch-ui .hud-hint {
+body.mobile-perf-hud .hud-hint {
   font-size: 0.66rem;
 }
 
-body.mobile-touch-ui .hud-speed {
+body.mobile-perf-hud .hud-speed {
   font-size: clamp(0.92rem, 2.8vw, 1.12rem);
   margin-top: 0.15rem;
-}
-
-body.mobile-touch-ui.game-running .mobile-controls {
-  padding-top: 0.5rem;
-  padding-bottom: max(0.65rem, env(safe-area-inset-bottom, 0px));
-  background: linear-gradient(180deg, transparent 0%, rgba(4, 6, 12, 0.55) 35%, rgba(4, 6, 12, 0.82) 100%);
-  backdrop-filter: blur(14px) saturate(1.15);
-  -webkit-backdrop-filter: blur(14px) saturate(1.15);
-}
-
-body.mobile-touch-ui .mobile-ctrl-stack {
-  max-width: min(12.5rem, 42vw);
-  gap: 0.42rem;
-}
-
-body.mobile-touch-ui .mobile-ctrl--lane {
-  flex: 0 0 min(5rem, 24vw);
-  min-height: 6.1rem;
-  border-radius: 1.15rem;
-  font-size: clamp(1.45rem, 6.5vw, 1.95rem);
-}
-
-body.mobile-touch-ui .mobile-ctrl--jump {
-  min-height: 3.45rem;
-  font-size: clamp(1rem, 4vw, 1.22rem);
-  border-radius: 1.1rem;
-}
-
-body.mobile-touch-ui .mobile-ctrl--back {
-  min-height: 2.55rem;
-  font-size: clamp(0.78rem, 3.4vw, 0.92rem);
-  border-radius: 0.95rem;
 }
