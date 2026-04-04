@@ -2902,6 +2902,119 @@ function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, p
   });
 }
 
+/** One BoxGeometry per obstacle shape — avoids per-spawn allocs + upload spikes. */
+let geoHazardTrainShared = null;
+let geoHazardLowShared = null;
+let geoHazardGapUnitShared = null;
+
+function getGeoHazardTrain() {
+  if (!geoHazardTrainShared) {
+    geoHazardTrainShared = new THREE.BoxGeometry(LANE_WIDTH * 0.85, 1.35, 3.2);
+    geoHazardTrainShared.userData.sharedGameplayGeo = true;
+  }
+  return geoHazardTrainShared;
+}
+
+function getGeoHazardLow() {
+  if (!geoHazardLowShared) {
+    geoHazardLowShared = new THREE.BoxGeometry(LANE_WIDTH * 0.75, 0.45, 0.55);
+    geoHazardLowShared.userData.sharedGameplayGeo = true;
+  }
+  return geoHazardLowShared;
+}
+
+function getGeoHazardGapUnit() {
+  if (!geoHazardGapUnitShared) {
+    geoHazardGapUnitShared = new THREE.BoxGeometry(1, 1, 1);
+    geoHazardGapUnitShared.userData.sharedGameplayGeo = true;
+  }
+  return geoHazardGapUnitShared;
+}
+
+/** Reused hazard hologram materials so WebGL compiles the holo shader once, not per obstacle. */
+const hazardHoloPool = [];
+
+function hazardHoloPoolTargetSize() {
+  return mobilePerf ? 22 : 34;
+}
+
+function initHazardHoloPool() {
+  const want = hazardHoloPoolTargetSize();
+  while (hazardHoloPool.length < want) {
+    const mat = makeHologramBoxMaterial(
+      new THREE.Color(0xff2200),
+      new THREE.Color(0xff66aa),
+      0.35,
+      0.92,
+      hazardHoloPool.length * 0.31,
+    );
+    mat.userData.hazardPool = true;
+    mat.userData.poolBusy = false;
+    hazardHoloPool.push(mat);
+  }
+}
+
+function acquireHazardHoloMaterial(core, edge, alpha, halo, phase) {
+  initHazardHoloPool();
+  for (let i = 0; i < hazardHoloPool.length; i++) {
+    const m = hazardHoloPool[i];
+    if (!m.userData.poolBusy) {
+      m.userData.poolBusy = true;
+      m.uniforms.uCoreColor.value.copy(core);
+      m.uniforms.uEdgeColor.value.copy(edge);
+      m.uniforms.uAlpha.value = alpha;
+      m.uniforms.uHalo.value = halo;
+      m.uniforms.uPhase.value = phase;
+      return m;
+    }
+  }
+  const fallback = makeHologramBoxMaterial(core, edge, alpha, halo, phase);
+  fallback.userData.hazardPool = false;
+  return fallback;
+}
+
+function releaseHazardHoloMaterial(m) {
+  if (!m) return;
+  if (m.userData?.hazardPool) {
+    m.userData.poolBusy = false;
+    return;
+  }
+  m.dispose?.();
+}
+
+function disposeObstacleVisualResources(root) {
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    const g = o.geometry;
+    if (g && !g.userData?.sharedGameplayGeo) g.dispose?.();
+    releaseHazardHoloMaterial(o.material);
+  });
+}
+
+/** One-time GPU compile for pooled holo materials (critical on iOS where full-scene compile is skipped). */
+function warmHazardHoloShaderPrograms() {
+  if (!renderer || !scene || !camera) return;
+  initHazardHoloPool();
+  if (hazardHoloPool.length === 0) return;
+  const grp = new THREE.Group();
+  grp.position.set(0, -9000, 0);
+  for (let i = 0; i < hazardHoloPool.length; i++) {
+    const wg = new THREE.BoxGeometry(1, 1, 1);
+    const mesh = new THREE.Mesh(wg, hazardHoloPool[i]);
+    grp.add(mesh);
+  }
+  scene.add(grp);
+  try {
+    renderer.render(scene, camera);
+  } catch {
+    /* ignore */
+  }
+  scene.remove(grp);
+  grp.traverse((o) => {
+    if (o.isMesh) o.geometry?.dispose?.();
+  });
+}
+
 const BOOST_VS = `
   varying vec3 vLocalPos;
   varying vec3 vNormal;
@@ -3064,12 +3177,17 @@ function setPadUsedUniform(root, used) {
 function syncHologramTimeUniforms(t) {
   if (!scene) return;
   if (mobilePerf && (renderFrameIndex & 1) === 1) return;
+  for (let i = 0; i < hazardHoloPool.length; i++) {
+    const mat = hazardHoloPool[i];
+    if (mat?.uniforms?.uTime) mat.uniforms.uTime.value = t;
+  }
   scene.traverse((obj) => {
     const m = obj.material;
     if (!m) return;
     const list = Array.isArray(m) ? m : [m];
     for (const mat of list) {
       if (!mat?.uniforms?.uTime) continue;
+      if (mat.userData?.hazardPool) continue;
       if (
         mat === runwaySlabMat ||
         mat === musicGridFloorMaterial ||
@@ -3235,8 +3353,8 @@ function spawnObstacle(z, travelSpeed) {
   if (roll < 0.36) {
     kind = 'train';
     const { core, edge } = sampleHazardHologramColors();
-    const mat = makeHologramBoxMaterial(core, edge, 0.34, 0.92, rng() * Math.PI * 2);
-    mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.85, 1.35, 3.2), mat);
+    const mat = acquireHazardHoloMaterial(core, edge, 0.34, 0.92, rng() * Math.PI * 2);
+    mesh = new THREE.Mesh(getGeoHazardTrain(), mat);
     mesh.position.set(laneX(lane), 0.75, z);
   } else if (roll < 0.62) {
     kind = 'gap';
@@ -3250,7 +3368,7 @@ function spawnObstacle(z, travelSpeed) {
     const g0 = laneX(openLane) - LANE_WIDTH * 0.5;
     const g1 = laneX(openLane) + LANE_WIDTH * 0.5;
     const { core, edge } = sampleHazardHologramColors();
-    const mat = makeHologramBoxMaterial(core, edge, 0.35, 0.94, rng() * Math.PI * 2);
+    const ph = rng() * Math.PI * 2;
     mesh = new THREE.Group();
     mesh.position.set(0, 0, z);
     const h = 1.35;
@@ -3258,7 +3376,9 @@ function spawnObstacle(z, travelSpeed) {
     if (g0 > TRACK_X_MIN + 0.04) {
       const w = g0 - TRACK_X_MIN;
       const cx = (TRACK_X_MIN + g0) * 0.5;
-      const blk = new THREE.Mesh(new THREE.BoxGeometry(w * bwMul, h, GAP_WALL_DEPTH), mat);
+      const matL = acquireHazardHoloMaterial(core, edge, 0.35, 0.94, ph);
+      const blk = new THREE.Mesh(getGeoHazardGapUnit(), matL);
+      blk.scale.set(w * bwMul, h, GAP_WALL_DEPTH);
       blk.position.set(cx, GAP_WALL_Y, 0);
       blk.castShadow = false;
       mesh.add(blk);
@@ -3266,7 +3386,9 @@ function spawnObstacle(z, travelSpeed) {
     if (TRACK_X_MAX > g1 + 0.04) {
       const w = TRACK_X_MAX - g1;
       const cx = (g1 + TRACK_X_MAX) * 0.5;
-      const blk = new THREE.Mesh(new THREE.BoxGeometry(w * bwMul, h, GAP_WALL_DEPTH), mat);
+      const matR = acquireHazardHoloMaterial(core, edge, 0.35, 0.94, ph + 0.22);
+      const blk = new THREE.Mesh(getGeoHazardGapUnit(), matR);
+      blk.scale.set(w * bwMul, h, GAP_WALL_DEPTH);
       blk.position.set(cx, GAP_WALL_Y, 0);
       blk.castShadow = false;
       mesh.add(blk);
@@ -3281,8 +3403,8 @@ function spawnObstacle(z, travelSpeed) {
   } else {
     kind = 'low';
     const { core, edge } = sampleHazardHologramColors();
-    const mat = makeHologramBoxMaterial(core, edge, 0.36, 0.9, rng() * Math.PI * 2);
-    mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.75, 0.45, 0.55), mat);
+    const mat = acquireHazardHoloMaterial(core, edge, 0.36, 0.9, rng() * Math.PI * 2);
+    mesh = new THREE.Mesh(getGeoHazardLow(), mat);
     mesh.position.set(laneX(lane), 0.22, z);
   }
 
@@ -4218,7 +4340,10 @@ function restart() {
   lastObstacleCenterZ = -1e9;
   rng = mulberry32(0x9e3779b9 + Date.now() % 1e6);
 
-  for (const o of obstacles) scene.remove(o.mesh);
+  for (const o of obstacles) {
+    disposeObstacleVisualResources(o.mesh);
+    scene.remove(o.mesh);
+  }
   obstacles.length = 0;
   for (const c of coins) {
     scene.remove(c.mesh);
@@ -4738,6 +4863,7 @@ function tick(dt) {
 
   for (let i = obstacles.length - 1; i >= 0; i--) {
     if (obstacles[i].mesh.position.z < pz - 25) {
+      disposeObstacleVisualResources(obstacles[i].mesh);
       scene.remove(obstacles[i].mesh);
       obstacles.splice(i, 1);
     }
@@ -4904,6 +5030,7 @@ async function preloadGraphicsPipeline() {
         renderer.render(scene, camera);
         await new Promise((r) => requestAnimationFrame(r));
       }
+      warmHazardHoloShaderPrograms();
     })();
   }
   try {
