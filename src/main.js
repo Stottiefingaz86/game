@@ -2167,10 +2167,16 @@ function enhanceCoinGltfMaterials(root) {
 function disposeObjectSubtree(obj) {
   obj.traverse((o) => {
     if (o.isMesh) {
-      o.geometry?.dispose();
+      const g = o.geometry;
+      if (g && !g.userData?.sharedGameplayGeo) g.dispose?.();
       const mat = o.material;
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose?.());
-      else mat?.dispose?.();
+      if (Array.isArray(mat)) {
+        mat.forEach((m) => {
+          if (m && !m.userData?.sharedCoinHolo) m.dispose?.();
+        });
+      } else if (mat && !mat.userData?.sharedCoinHolo) {
+        mat.dispose?.();
+      }
     }
   });
 }
@@ -2178,6 +2184,11 @@ function disposeObjectSubtree(obj) {
 async function loadCoinPrefab() {
   coinPrefab = null;
   coinPrefabIsSkinned = false;
+  /** GLB coins = many clones + skinning cost; mobile uses one shared holo mesh+material. */
+  if (mobilePerf) {
+    console.info('AstroRun: mobile uses lightweight shared holo coins (GLB skipped).');
+    return;
+  }
   const loader = new GLTFLoader();
   for (const rel of COIN_GLTF_CANDIDATES) {
     try {
@@ -2218,11 +2229,38 @@ async function loadCoinPrefab() {
   console.warn('No coin GLB found; using hologram boxes.', COIN_GLTF_CANDIDATES);
 }
 
-function makeFallbackCoinVisual() {
-  const core = new THREE.Color(0xffd24a);
-  const edge = new THREE.Color(0x66fff0);
-  const mat = makeHologramBoxMaterial(core, edge, 0.38, 1.12);
-  const inner = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.35, 0.12), mat);
+let sharedCoinBoxGeo = null;
+let sharedCoinGoldHoloMat = null;
+let sharedCoinPurpleHoloMat = null;
+
+function ensureSharedCoinVisualAssets() {
+  if (!sharedCoinBoxGeo) {
+    sharedCoinBoxGeo = new THREE.BoxGeometry(0.35, 0.35, 0.12);
+    sharedCoinBoxGeo.userData.sharedGameplayGeo = true;
+  }
+  if (!sharedCoinGoldHoloMat) {
+    sharedCoinGoldHoloMat = makeHologramBoxMaterial(
+      new THREE.Color(0xffd24a),
+      new THREE.Color(0x66fff0),
+      0.38,
+      1.12,
+      0,
+    );
+    sharedCoinGoldHoloMat.userData.sharedCoinHolo = true;
+  }
+  if (!sharedCoinPurpleHoloMat) {
+    const core = new THREE.Color().setHSL(0.76, 0.78, 0.5);
+    const edge = new THREE.Color().setHSL(0.8, 1, 0.68);
+    sharedCoinPurpleHoloMat = makeHologramBoxMaterial(core, edge, 0.4, 1.1, 1.15);
+    sharedCoinPurpleHoloMat.userData.sharedCoinHolo = true;
+  }
+}
+
+/** Shared geometry + material: many coin instances, one GPU program, no per-coin shader alloc. */
+function makeFallbackCoinVisual(purple = false) {
+  ensureSharedCoinVisualAssets();
+  const mat = purple ? sharedCoinPurpleHoloMat : sharedCoinGoldHoloMat;
+  const inner = new THREE.Mesh(sharedCoinBoxGeo, mat);
   inner.rotation.y = Math.PI / 4;
   const g = new THREE.Group();
   g.add(inner);
@@ -2230,10 +2268,16 @@ function makeFallbackCoinVisual() {
   return g;
 }
 
-/** Clone GLB coin or build fallback; returns a Group at origin (feet on y=0 for GLB). */
-function cloneCoinVisual() {
+/**
+ * @param {{ purple?: boolean }} [opts] — purple tunnel/jump/roof variants (desktop GLB still tinted in spawn).
+ */
+function cloneCoinVisual(opts = {}) {
+  const wantPurple = opts.purple === true;
+  if (mobilePerf || (coinPrefab && coinPrefabIsSkinned)) {
+    return makeFallbackCoinVisual(wantPurple);
+  }
   if (coinPrefab) {
-    const g = coinPrefabIsSkinned ? cloneSkinnedModel(coinPrefab) : coinPrefab.clone(true);
+    const g = coinPrefab.clone(true);
     enhanceCoinGltfMaterials(g);
     g.traverse((o) => {
       if (o.isMesh) {
@@ -2243,9 +2287,10 @@ function cloneCoinVisual() {
     });
     g.userData.isCoinGltf = true;
     g.renderOrder = 8;
+    if (wantPurple) applyPurpleTunnelCoinTint(g);
     return g;
   }
-  return makeFallbackCoinVisual();
+  return makeFallbackCoinVisual(wantPurple);
 }
 
 /** Roof “mega” coins: obvious purple so they read on top of tunnels. */
@@ -3475,7 +3520,7 @@ function spawnObstacle(z, travelSpeed) {
 
 function spawnCoinRow(z) {
   const lane = LANES[Math.floor(rng() * 3)];
-  const n = 3 + Math.floor(rng() * 4);
+  const n = mobilePerf ? 2 + Math.floor(rng() * 2) : 3 + Math.floor(rng() * 4);
   for (let i = 0; i < n; i++) {
     const visual = cloneCoinVisual();
     const zz = z + i * 1.1;
@@ -3502,18 +3547,17 @@ function spawnCoinRow(z) {
   }
   const rowEnd = z + (n - 1) * 1.1;
   if (zRangeOverlapsAnyTunnel(z - 1, rowEnd + 1)) spawnMegaRoofCoinsAlongRow(z, n, lane);
-  if (rng() < 0.48) spawnPurpleJumpCoinRow(z + 0.42, lane);
+  if (rng() < (mobilePerf ? 0.32 : 0.48)) spawnPurpleJumpCoinRow(z + 0.42, lane);
 }
 
 /**
  * Purple coins over the track (not tunnel roof): high Y so standing collect fails; jump overlaps body band.
  */
 function spawnPurpleJumpCoinRow(z, lane) {
-  const n = 2 + Math.floor(rng() * 4);
+  const n = mobilePerf ? 2 + Math.floor(rng() * 2) : 2 + Math.floor(rng() * 4);
   for (let i = 0; i < n; i++) {
     const zz = z + i * 1.02;
-    const visual = cloneCoinVisual();
-    applyPurpleTunnelCoinTint(visual);
+    const visual = cloneCoinVisual({ purple: true });
     const cy =
       PURPLE_JUMP_COIN_Y + (rng() - 0.5) * 2 * PURPLE_JUMP_COIN_Y_JITTER;
     visual.position.set(laneX(lane), cy, sceneTrackZ(zz));
@@ -3551,13 +3595,13 @@ function spawnMegaRoofCoinsAlongRow(z, n, lane) {
   const rowEnd = z + (n - 1) * 1.1;
   const laneBase = LANES.indexOf(lane);
   let idx = 0;
-  for (let zz = z; zz <= rowEnd + 0.02; zz += 0.72) {
+  const megaStep = mobilePerf ? 1.12 : 0.72;
+  for (let zz = z; zz <= rowEnd + 0.02; zz += megaStep) {
     if (!getTunnelStripeAtZ(zz)) continue;
     const li = ((laneBase >= 0 ? laneBase : 1) + idx) % 3;
     const useLane = LANES[li];
     idx += 1;
-    const visual = cloneCoinVisual();
-    applyPurpleTunnelCoinTint(visual);
+    const visual = cloneCoinVisual({ purple: true });
     visual.position.set(laneX(useLane), y, sceneTrackZ(zz));
     visual.scale.multiplyScalar(1.48);
     if (visual.userData.isCoinGltf) {
@@ -3588,15 +3632,14 @@ function spawnMegaRoofCoinsAlongRow(z, n, lane) {
 function spawnPurpleTunnelRoofTrail(z0, lengthZ) {
   const { roofTopY } = tunnelGeomConsts();
   const y = roofTopY + 0.55;
-  const step = 0.86;
+  const step = mobilePerf ? 1.28 : 0.86;
   let laneRot = Math.floor(rng() * 3);
   for (let t = 0; t < lengthZ; t += step) {
     const zz = z0 + t;
     if (!getTunnelStripeAtZ(zz)) continue;
     const useLane = LANES[laneRot % 3];
     laneRot += 1 + Math.floor(rng() * 2);
-    const visual = cloneCoinVisual();
-    applyPurpleTunnelCoinTint(visual);
+    const visual = cloneCoinVisual({ purple: true });
     visual.position.set(laneX(useLane), y, sceneTrackZ(zz));
     visual.scale.multiplyScalar(1.42);
     if (visual.userData.isCoinGltf) {
@@ -4895,11 +4938,8 @@ function tick(dt) {
 
   const roofTopYMega = tunnelGeomConsts().roofTopY;
   const spinIdleCoin = (c) => {
+    /** Y-only spin: extra euler axes + trig per coin were a hotspot with many GLB instances. */
     c.mesh.rotation.y += dt * 4.8;
-    if (c.mesh.userData?.isCoinGltf) {
-      c.mesh.rotation.x += dt * 0.85 * Math.sin(distance * 0.08 + c.z * 0.2);
-      c.mesh.rotation.z += dt * 0.45 * Math.cos(distance * 0.06 + c.z * 0.15);
-    }
   };
   /** One coin sound per frame max (rows used to stack many `play()` calls in one tick). */
   let coinSfxCountAfterPickups = -1;
