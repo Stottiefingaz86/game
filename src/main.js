@@ -18,6 +18,67 @@ function syncPlayCursor() {
     (overlay && !overlay.classList.contains('hidden'));
   document.body.classList.toggle('game-running', inActiveRun);
   document.body.classList.toggle('menu-cursor', menuCursor);
+  const mobileControlsEl = document.getElementById('mobile-controls');
+  if (mobileControlsEl && document.body.classList.contains('mobile-touch-ui')) {
+    mobileControlsEl.setAttribute('aria-hidden', inActiveRun ? 'false' : 'true');
+  }
+}
+
+function wireMobileTouchControls() {
+  const left = document.getElementById('mobile-lane-left');
+  const right = document.getElementById('mobile-lane-right');
+  const jump = document.getElementById('mobile-jump');
+  const back = document.getElementById('mobile-back');
+  const absorb = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  left?.addEventListener('pointerdown', (e) => {
+    absorb(e);
+    try {
+      canvas.focus({ preventScroll: true });
+    } catch {
+      /* ignore */
+    }
+    unlockBgm();
+    if (!alive || !runGameplayActive) return;
+    shiftLaneFromInput(1);
+  });
+  right?.addEventListener('pointerdown', (e) => {
+    absorb(e);
+    try {
+      canvas.focus({ preventScroll: true });
+    } catch {
+      /* ignore */
+    }
+    unlockBgm();
+    if (!alive || !runGameplayActive) return;
+    shiftLaneFromInput(-1);
+  });
+  jump?.addEventListener('pointerdown', (e) => {
+    absorb(e);
+    unlockBgm();
+    if (!gameStarted) return;
+    if (!alive) {
+      restart();
+      return;
+    }
+    tryJump();
+  });
+  const backDown = (e) => {
+    absorb(e);
+    unlockBgm();
+    if (!gameStarted || !alive || !runGameplayActive) return;
+    runBackwardHeld = true;
+  };
+  const backUp = () => {
+    runBackwardHeld = false;
+  };
+  back?.addEventListener('pointerdown', backDown);
+  back?.addEventListener('pointerup', backUp);
+  back?.addEventListener('pointerleave', backUp);
+  back?.addEventListener('pointercancel', backUp);
+  back?.addEventListener('lostpointercapture', backUp);
 }
 
 function closeStartInstructionsModal() {
@@ -196,18 +257,43 @@ function showGameOverRollup(metersRun, coinsCollected, finalScore) {
   runCount(overlayScoreEl, finalScore, 950, 580, (v) => String(v));
 }
 
-/** Touch phones/tablets: fewer pixels + no shadow pass (biggest WebGL wins on weak GPUs). */
+/**
+ * Phones / tablets: tune renderer, skip heavy audio graph, fewer spawns.
+ * Narrow window + touch/coarse avoids mis-detecting desktop; UA catches phones in any layout.
+ */
 function preferMobilePerf() {
+  if (typeof window === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const uaMobile = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  if (uaMobile) return true;
+  const maxTouch = navigator.maxTouchPoints ?? 0;
+  const narrow =
+    typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 900px)').matches;
   const coarse =
     typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
-  const uaMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-  return coarse || uaMobile;
+  return narrow && (coarse || maxTouch > 0);
+}
+
+/**
+ * On-screen ◀ Jump ▶: only phones/tablets and touch-primary narrow layouts.
+ * Desktop touchscreens (narrow window + maxTouch) must not get this — keyboard/mouse stay primary.
+ */
+function preferMobileOnScreenControls() {
+  if (typeof window === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  if (/Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua)) return true;
+  const narrow =
+    typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 900px)').matches;
+  const coarse =
+    typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+  return narrow && coarse;
 }
 
 let scene, camera, renderer;
 /** Set in init: skip shadow map + tune resolution. */
 let mobilePerf = false;
+/** Frame counter for lobby + game loop (hologram uniform throttle). */
+let renderFrameIndex = 0;
 /** True after `init()` completes (WebGL + scene). Used to avoid double init on retry. */
 let graphicsInited = false;
 /** Reused so Play + background lobby never double-load the player GLB. */
@@ -316,6 +402,8 @@ let pointerDownY = 0;
 let activePointerId = null;
 let mouseLaneAccum = 0;
 let didDragLaneChange = false;
+/** Previous `clientX` during a touch drag; `movementX` is unreliable on mobile. */
+let lastTouchLaneX = 0;
 
 let playerLane = 0;
 let targetLaneX = 0;
@@ -516,7 +604,7 @@ function makeRunwaySlabShaderMaterial() {
       uVoid: { value: new THREE.Color(0x030009) },
       uEnvMap: { value: null },
       uCamPos: { value: new THREE.Vector3() },
-      uEnvIntensity: { value: 1.58 },
+      uEnvIntensity: { value: mobilePerf ? 1.02 : 1.58 },
       uFootFlash: { value: 0 },
       uPlayerX: { value: 0 },
       uPlayerZ: { value: 0 },
@@ -791,10 +879,12 @@ function initCoinAudioPool() {
   coinPoolIdx = 0;
   const url = sfxObjectUrls.coin;
   if (!url) return;
-  for (let i = 0; i < 4; i += 1) {
+  const n = mobilePerf ? 2 : 4;
+  for (let i = 0; i < n; i += 1) {
     const a = new Audio(url);
     a.preload = 'auto';
     a.volume = 0.52;
+    if (mobilePerf) a.playsInline = true;
     coinAudioPool.push(a);
   }
 }
@@ -1365,6 +1455,7 @@ function lobbyLoop(now) {
     lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
     return;
   }
+  renderFrameIndex += 1;
   const dt = lobbyLastTime ? Math.min(0.05, (now - lobbyLastTime) / 1000) : 0.016;
   lobbyLastTime = now;
   holoTime += dt;
@@ -2701,6 +2792,7 @@ function setPadUsedUniform(root, used) {
 
 function syncHologramTimeUniforms(t) {
   if (!scene) return;
+  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
   scene.traverse((obj) => {
     const m = obj.material;
     if (!m) return;
@@ -2743,7 +2835,8 @@ function ensureRunwayExtendsTo(minZEnd) {
 
 function spawnChunk(endZ) {
   const z0 = endZ;
-  if (rng() < TUNNEL_CHUNK_CHANCE) {
+  const tunnelP = TUNNEL_CHUNK_CHANCE * (mobilePerf ? 0.68 : 1);
+  if (rng() < tunnelP) {
     const tLen = TUNNEL_LENGTH_MIN + rng() * TUNNEL_LENGTH_RANGE;
     worldGroup.add(makeTunnelStripe(z0, tLen));
     return z0 + tLen;
@@ -3110,8 +3203,9 @@ function getOrCreateBgmAudioContext() {
   return bgmAudioContext;
 }
 
-/** Call synchronously on Play tap so Safari will allow audio graph + FFT later. */
+/** Call synchronously on Play tap so Safari will allow audio graph + FFT later (desktop only). */
 function primeBgmAudioContext() {
+  if (preferMobilePerf()) return;
   const ctx = getOrCreateBgmAudioContext();
   if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
 }
@@ -3122,6 +3216,7 @@ function primeBgmAudioContext() {
  */
 function tryAttachBgmAnalyser() {
   if (!bgmAudio || bgmAnalyser) return;
+  if (preferMobilePerf()) return;
   const ctx = getOrCreateBgmAudioContext();
   if (!ctx) return;
   try {
@@ -3257,8 +3352,8 @@ function createMusicBackdrop() {
   musicBackdropGroup = new THREE.Group();
   musicBackdropGroup.name = 'musicBackdrop';
 
-  const skySegs = mobilePerf ? 12 : 20;
-  const skyRings = mobilePerf ? 8 : 14;
+  const skySegs = mobilePerf ? 10 : 20;
+  const skyRings = mobilePerf ? 6 : 14;
   const skyGeo = new THREE.SphereGeometry(145, skySegs, skyRings);
   musicSkyMaterial = new THREE.ShaderMaterial({
     uniforms: {
@@ -3330,8 +3425,8 @@ function createMusicBackdrop() {
   skyMesh.renderOrder = -500;
   musicBackdropGroup.add(skyMesh);
 
-  const gridW = mobilePerf ? 220 : 290;
-  const gridD = mobilePerf ? 350 : 440;
+  const gridW = mobilePerf ? 168 : 290;
+  const gridD = mobilePerf ? 280 : 440;
   const floorGeo = new THREE.PlaneGeometry(gridW, gridD, 1, 1);
   musicGridFloorMaterial = makeNeonGridShaderMaterial(false);
   const floor = new THREE.Mesh(floorGeo, musicGridFloorMaterial);
@@ -3340,14 +3435,18 @@ function createMusicBackdrop() {
   floor.renderOrder = -480;
   musicBackdropGroup.add(floor);
 
-  musicGridCeilingMaterial = makeNeonGridShaderMaterial(true);
-  const ceil = new THREE.Mesh(floorGeo.clone(), musicGridCeilingMaterial);
-  ceil.rotation.x = Math.PI / 2;
-  ceil.position.set(0, 38, gridD * 0.38);
-  ceil.renderOrder = -480;
-  musicBackdropGroup.add(ceil);
+  if (!mobilePerf) {
+    musicGridCeilingMaterial = makeNeonGridShaderMaterial(true);
+    const ceil = new THREE.Mesh(floorGeo.clone(), musicGridCeilingMaterial);
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.set(0, 38, gridD * 0.38);
+    ceil.renderOrder = -480;
+    musicBackdropGroup.add(ceil);
+  } else {
+    musicGridCeilingMaterial = null;
+  }
 
-  const starN = mobilePerf ? 92 : 198;
+  const starN = mobilePerf ? 52 : 198;
   const starPos = new Float32Array(starN * 3);
   for (let i = 0; i < starN; i++) {
     starPos[i * 3] = (Math.random() - 0.5) * 168;
@@ -3379,7 +3478,7 @@ function updateMusicReactiveVisuals(dt) {
   musicPulseTime += dt * (back ? -1 : 1);
   const pz = playerGroup ? playerGroup.position.z : 0;
   musicBackdropGroup.position.set(0, 0, pz);
-  musicBackdropGroup.updateMatrixWorld(true);
+  musicBackdropGroup.updateMatrixWorld(!mobilePerf);
 
   const raw = sampleBgmBands();
   const bandK = 1 - Math.exp(-dt * 2.6);
@@ -3504,18 +3603,22 @@ function updateMusicReactiveVisuals(dt) {
 
 function init() {
   if (graphicsInited) return;
+  mobilePerf = preferMobilePerf();
+
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0c0822);
-  scene.fog = new THREE.Fog(0x281845, 32, 108);
+  if (mobilePerf) {
+    scene.fog = new THREE.Fog(0x281845, 24, 78);
+  } else {
+    scene.fog = new THREE.Fog(0x281845, 32, 108);
+  }
   scene.userData.musicFogBase = new THREE.Color(scene.fog.color.getHex());
 
-  camera = new THREE.PerspectiveCamera(CAMERA_FOV_GAMEPLAY, 1, 0.1, 520);
+  camera = new THREE.PerspectiveCamera(CAMERA_FOV_GAMEPLAY, 1, 0.1, mobilePerf ? 240 : 520);
   // Player runs toward +Z; camera stays behind (-Z) and looks ahead (+Z).
   camera.position.set(0, CAM_Y_AT_REST, -CAM_GAME_Z_OFFSET);
   cameraGameplayBasePos.copy(camera.position);
   camera.lookAt(0, CAM_LOOK_Y_AT_REST * 0.76, 10);
-
-  mobilePerf = preferMobilePerf();
 
   renderer = new THREE.WebGLRenderer({
     canvas,
@@ -3524,14 +3627,17 @@ function init() {
     stencil: false,
     depth: true,
   });
-  const pixelRatio = mobilePerf
-    ? Math.min(window.devicePixelRatio, 1)
-    : Math.min(window.devicePixelRatio, 1.5);
-  renderer.setPixelRatio(pixelRatio);
+  const dprCap = mobilePerf ? 0.88 : 1.5;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.18;
+  if (mobilePerf) {
+    renderer.toneMapping = THREE.LinearToneMapping;
+    renderer.toneMappingExposure = 1.05;
+  } else {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.18;
+  }
   renderer.shadowMap.enabled = !mobilePerf;
   renderer.shadowMap.type = THREE.BasicShadowMap;
 
@@ -3561,7 +3667,7 @@ function init() {
   scene.add(worldGroup);
 
   let zEnd = 0;
-  const initialChunks = mobilePerf ? 4 : 6;
+  const initialChunks = mobilePerf ? 3 : 6;
   for (let i = 0; i < initialChunks; i++) zEnd = spawnChunk(zEnd);
   ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
 
@@ -3592,8 +3698,25 @@ function init() {
 
   overlay?.addEventListener('click', restart);
 
+  if (preferMobileOnScreenControls()) {
+    document.body.classList.add('mobile-touch-ui');
+    wireMobileTouchControls();
+  }
+  if (mobilePerf) {
+    const kickMobileAudio = () => {
+      if (!gameStarted || !bgmUnlocked) return;
+      if (bgmAudio && alive && bgmAudio.paused) void bgmAudio.play().catch(() => {});
+      if (runAudio && alive && runGameplayActive && runAudio.paused) void runAudio.play().catch(() => {});
+    };
+    canvas.addEventListener('touchstart', kickMobileAudio, { passive: true });
+  }
+
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && gameStarted && alive) syncBgmPlayState();
+    if (document.visibilityState !== 'visible' || !gameStarted || !alive) return;
+    syncBgmPlayState();
+    if (mobilePerf && runAudio && runGameplayActive && runAudio.paused) {
+      void runAudio.play().catch(() => {});
+    }
   });
 
   graphicsInited = true;
@@ -3604,6 +3727,8 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  const dprCap = mobilePerf ? 0.88 : 1.5;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
 }
 
 /** Must match ground contact tolerance in `tick` (~`playerY <= 0.035`); too tight and jump never fires. */
@@ -3701,6 +3826,7 @@ function onPointerDown(e) {
   unlockBgm();
   pointerDownX = e.clientX;
   pointerDownY = e.clientY;
+  lastTouchLaneX = e.clientX;
   activePointerId = e.pointerId;
   mouseLaneAccum = 0;
   didDragLaneChange = false;
@@ -3721,11 +3847,13 @@ function onPointerMove(e) {
     return;
   }
 
-  // Touch: change lane only while finger is down (drag).
+  // Touch: lane from real screen delta (movementX is often wrong or inverted on iOS/Android).
   if (!(e.buttons & 1)) return;
   if (activePointerId == null || e.pointerId !== activePointerId) return;
   const TOUCH_DRAG_LANE_PX = 72;
-  mouseLaneAccum += e.movementX;
+  const ddx = e.clientX - lastTouchLaneX;
+  lastTouchLaneX = e.clientX;
+  mouseLaneAccum -= ddx;
   if (mouseLaneAccum >= TOUCH_DRAG_LANE_PX) {
     shiftLaneFromInput(1);
     mouseLaneAccum = 0;
@@ -3804,7 +3932,7 @@ function restart() {
 
   while (worldGroup.children.length) worldGroup.remove(worldGroup.children[0]);
   let zEnd = 0;
-  const restartChunks = mobilePerf ? 4 : 6;
+  const restartChunks = mobilePerf ? 3 : 6;
   for (let i = 0; i < restartChunks; i++) zEnd = spawnChunk(zEnd);
   ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
 
@@ -4152,7 +4280,7 @@ function tick(dt) {
   const lookY = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
   camera.lookAt(playerGroup.position.x * 0.4, lookY, pz + 10);
 
-  const spawnLookahead = 78;
+  const spawnLookahead = mobilePerf ? 54 : 78;
   while (nextSpawnZ < pz + spawnLookahead) {
     const roll = rng();
     if (roll < 0.38) {
@@ -4331,6 +4459,7 @@ let last = performance.now();
 function loop(now) {
   if (!graphicsInited || !renderer) return;
   if (gameStarted) stopLobbyRenderLoop();
+  renderFrameIndex += 1;
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   holoTime += dt;
@@ -4374,6 +4503,9 @@ async function preloadAudioPipeline() {
     a.preload = 'auto';
     a.loop = true;
     a.volume = BGM_VOLUME;
+    if (preferMobilePerf()) {
+      a.playsInline = true;
+    }
     await waitAudioElementReady(a);
     if (a.error) {
       revokeBgmBlobUrl();
@@ -4389,6 +4521,9 @@ async function preloadAudioPipeline() {
     r.loop = true;
     r.preload = 'auto';
     r.volume = 0.32;
+    if (preferMobilePerf()) {
+      r.playsInline = true;
+    }
     await waitAudioElementReady(r);
     if (!r.error) runAudio = r;
   }
@@ -4407,7 +4542,8 @@ async function preloadGraphicsPipeline() {
       if (typeof renderer.compile === 'function') {
         renderer.compile(scene, camera);
       }
-      for (let i = 0; i < 3; i += 1) {
+      const warmFrames = mobilePerf ? 1 : 3;
+      for (let i = 0; i < warmFrames; i += 1) {
         renderer.render(scene, camera);
         await new Promise((r) => requestAnimationFrame(r));
       }

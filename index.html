@@ -2,7 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>AstroRun — Three.js</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -56,9 +58,12 @@
       <div class="start-instructions-panel">
         <h2 id="start-instructions-heading" class="start-instructions-heading">How to play</h2>
         <ul class="start-instructions-list">
-          <li><strong>Lanes:</strong> ← → or A D · mouse left / center / right</li>
-          <li><strong>Jump:</strong> space / up / W · click / tap (mobile)</li>
-          <li><strong>Backward:</strong> S or ↓ (max 10 m behind best distance; release to run forward)</li>
+          <li><strong>Lanes:</strong> ← → or A D · mouse left / center / right · on phone: ◀ ▶ buttons</li>
+          <li><strong>Jump:</strong> space / up / W · click / tap · on phone: Jump button</li>
+          <li>
+            <strong>Backward:</strong> S or ↓ · on phone hold <strong>Back</strong> (max 10 m behind best
+            distance; release to run forward)
+          </li>
           <li><strong>Duck:</strong> auto while holding backward on the ground — slip under low beams</li>
           <li><strong>Score:</strong> coins × meters</li>
         </ul>
@@ -104,11 +109,28 @@
               <span class="overlay-formula">coins × meters</span>
             </div>
           </div>
-          <p class="overlay-retry">space / tap to restart</p>
+          <p class="overlay-retry">Tap anywhere or press space to restart</p>
         </div>
       </div>
-      <div id="hint">
-        ← → or A D · mouse left / center / right for lanes · swipe · click = jump · S or ↓ = run backward (max 10 m behind your best forward distance; face cam, music & run SFX very slow) + duck under beams — release ↓ to go forward again
+      <div
+        id="mobile-controls"
+        class="mobile-controls"
+        aria-hidden="true"
+      >
+        <button type="button" class="mobile-ctrl mobile-ctrl--lane" id="mobile-lane-left" aria-label="Move left">
+          ◀
+        </button>
+        <div class="mobile-ctrl-stack">
+          <button type="button" class="mobile-ctrl mobile-ctrl--jump" id="mobile-jump" aria-label="Jump">
+            Jump
+          </button>
+          <button type="button" class="mobile-ctrl mobile-ctrl--back" id="mobile-back" aria-label="Hold to run backward">
+            Back
+          </button>
+        </div>
+        <button type="button" class="mobile-ctrl mobile-ctrl--lane" id="mobile-lane-right" aria-label="Move right">
+          ▶
+        </button>
       </div>
     </div>
     <canvas id="c"></canvas>
