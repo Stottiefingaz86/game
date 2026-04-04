@@ -6,6 +6,19 @@ import { clone as cloneSkinnedModel, retargetClip } from 'three/addons/utils/Ske
 
 const canvas = document.querySelector('#c');
 
+/** Append `?perf=1` to log avg/max ms per segment every 120 frames (mobile CPU debugging). */
+let perfHud = false;
+try {
+  perfHud =
+    typeof location !== 'undefined' &&
+    /(?:^|[?&])perf=1(?:&|$)/.test(location.search || '');
+} catch {
+  /* noop */
+}
+let perfSampleN = 0;
+const perfAcc = { tick: 0, mid: 0, music: 0, holo: 0, render: 0, total: 0 };
+const perfMax = { tick: 0, mid: 0, music: 0, holo: 0, render: 0, total: 0 };
+
 /** Cached `index.html` on CDNs/phones may still contain the old dock; new JS removes it. */
 document.getElementById('mobile-controls')?.remove();
 
@@ -2172,9 +2185,13 @@ function disposeObjectSubtree(obj) {
       const mat = o.material;
       if (Array.isArray(mat)) {
         mat.forEach((m) => {
-          if (m && !m.userData?.sharedCoinHolo) m.dispose?.();
+          if (m && !m.userData?.sharedCoinHolo) {
+            untrackHoloTimeMaterial(m);
+            m.dispose?.();
+          }
         });
       } else if (mat && !mat.userData?.sharedCoinHolo) {
+        untrackHoloTimeMaterial(mat);
         mat.dispose?.();
       }
     }
@@ -2937,6 +2954,19 @@ const TUNNEL_NEON_FS = `
   }
 `;
 
+/** Mobile: `syncHologramTimeUniforms` skips `scene.traverse` and only touches this set + hazard pool. */
+const holoTimeTrackedMaterials = new Set();
+
+function trackHoloTimeMaterial(mat) {
+  if (!mat?.uniforms?.uTime) return;
+  if (mat.userData?.hazardPool) return;
+  holoTimeTrackedMaterials.add(mat);
+}
+
+function untrackHoloTimeMaterial(mat) {
+  if (mat) holoTimeTrackedMaterials.delete(mat);
+}
+
 function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, phase = 0) {
   const mat = new THREE.ShaderMaterial({
     uniforms: {
@@ -2956,6 +2986,7 @@ function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, 
     side: THREE.DoubleSide,
   });
   mat.userData.tunnelNeon = true;
+  trackHoloTimeMaterial(mat);
   return mat;
 }
 
@@ -2988,7 +3019,7 @@ function syncTunnelNeonUniforms(dt) {
 }
 
 function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, phase = 0) {
-  return new THREE.ShaderMaterial({
+  const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
       uCoreColor: { value: coreColor.clone() },
@@ -3003,6 +3034,8 @@ function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, p
     depthWrite: false,
     side: THREE.DoubleSide,
   });
+  trackHoloTimeMaterial(mat);
+  return mat;
 }
 
 /** One BoxGeometry per obstacle shape — avoids per-spawn allocs + upload spikes. */
@@ -3053,6 +3086,7 @@ function initHazardHoloPool() {
     );
     mat.userData.hazardPool = true;
     mat.userData.poolBusy = false;
+    untrackHoloTimeMaterial(mat);
     hazardHoloPool.push(mat);
   }
 }
@@ -3082,6 +3116,7 @@ function releaseHazardHoloMaterial(m) {
     m.userData.poolBusy = false;
     return;
   }
+  untrackHoloTimeMaterial(m);
   m.dispose?.();
 }
 
@@ -3176,7 +3211,7 @@ const BOOST_FS = `
 `;
 
 function makeBoostHologramMaterial(isDecoy = false) {
-  return new THREE.ShaderMaterial({
+  const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
       uUsed: { value: 0 },
@@ -3190,6 +3225,8 @@ function makeBoostHologramMaterial(isDecoy = false) {
     depthWrite: false,
     side: THREE.DoubleSide,
   });
+  trackHoloTimeMaterial(mat);
+  return mat;
 }
 
 const POWER_FS = `
@@ -3222,7 +3259,7 @@ const POWER_FS = `
 `;
 
 function makePowerPadMaterial() {
-  return new THREE.ShaderMaterial({
+  const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
       uUsed: { value: 0 },
@@ -3235,6 +3272,8 @@ function makePowerPadMaterial() {
     depthWrite: false,
     side: THREE.DoubleSide,
   });
+  trackHoloTimeMaterial(mat);
+  return mat;
 }
 
 /** Curved launch strip: low at rear (-Z), rises toward +Z (direction of run). */
@@ -3279,10 +3318,15 @@ function setPadUsedUniform(root, used) {
 
 function syncHologramTimeUniforms(t) {
   if (!scene) return;
-  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
   for (let i = 0; i < hazardHoloPool.length; i++) {
     const mat = hazardHoloPool[i];
     if (mat?.uniforms?.uTime) mat.uniforms.uTime.value = t;
+  }
+  if (mobilePerf) {
+    holoTimeTrackedMaterials.forEach((mat) => {
+      if (mat?.uniforms?.uTime) mat.uniforms.uTime.value = t;
+    });
+    return;
   }
   scene.traverse((obj) => {
     const m = obj.material;
@@ -5059,8 +5103,15 @@ function loop() {
   renderFrameIndex += 1;
   const dt = Math.min(0.05, gameLoopClock.getDelta());
   holoTime += dt;
+  let perfT0;
+  let perfT1;
+  let perfT2;
+  let perfT3;
+  let perfT4;
+  if (perfHud) perfT0 = performance.now();
   const wasAliveBeforeTick = alive;
   tick(dt);
+  if (perfHud) perfT1 = performance.now();
   if (gameStarted && !alive && !wasAliveBeforeTick) {
     if (landShakeMag > 0.006) {
       decayLandShake(dt);
@@ -5082,9 +5133,49 @@ function loop() {
   }
   updateBgmPlayback(dt);
   updateRunSfx(dt);
+  if (perfHud) perfT2 = performance.now();
   updateMusicReactiveVisuals(dt);
+  if (perfHud) perfT3 = performance.now();
   syncHologramTimeUniforms(holoTime);
+  if (perfHud) perfT4 = performance.now();
   renderer.render(scene, camera);
+  if (perfHud) {
+    const perfT5 = performance.now();
+    const tickMs = perfT1 - perfT0;
+    const midMs = perfT2 - perfT1;
+    const musicMs = perfT3 - perfT2;
+    const holoMs = perfT4 - perfT3;
+    const renderMs = perfT5 - perfT4;
+    const totalMs = perfT5 - perfT0;
+    perfSampleN += 1;
+    perfAcc.tick += tickMs;
+    perfAcc.mid += midMs;
+    perfAcc.music += musicMs;
+    perfAcc.holo += holoMs;
+    perfAcc.render += renderMs;
+    perfAcc.total += totalMs;
+    perfMax.tick = Math.max(perfMax.tick, tickMs);
+    perfMax.mid = Math.max(perfMax.mid, midMs);
+    perfMax.music = Math.max(perfMax.music, musicMs);
+    perfMax.holo = Math.max(perfMax.holo, holoMs);
+    perfMax.render = Math.max(perfMax.render, renderMs);
+    perfMax.total = Math.max(perfMax.total, totalMs);
+    if (perfSampleN >= 120) {
+      const n = perfSampleN;
+      console.info('[AstroRun perf] avg ms / frame (last ' + n + 'f)', {
+        tick: (perfAcc.tick / n).toFixed(2),
+        mid: (perfAcc.mid / n).toFixed(2),
+        music: (perfAcc.music / n).toFixed(2),
+        holoSync: (perfAcc.holo / n).toFixed(2),
+        render: (perfAcc.render / n).toFixed(2),
+        total: (perfAcc.total / n).toFixed(2),
+      });
+      console.info('[AstroRun perf] max ms (same window)', { ...perfMax });
+      perfSampleN = 0;
+      perfAcc.tick = perfAcc.mid = perfAcc.music = perfAcc.holo = perfAcc.render = perfAcc.total = 0;
+      perfMax.tick = perfMax.mid = perfMax.music = perfMax.holo = perfMax.render = perfMax.total = 0;
+    }
+  }
   requestAnimationFrame(loop);
 }
 
