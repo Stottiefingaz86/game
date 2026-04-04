@@ -300,7 +300,11 @@ function isIPhoneOrIPod() {
 
 /** iOS Safari (and WebKit) expects this on `<audio>` for reliable inline / gesture-unlocked playback. */
 function prepareAudioElementForIOS(el) {
-  if (el && 'playsInline' in el) el.playsInline = true;
+  if (!el) return;
+  if ('playsInline' in el) el.playsInline = true;
+  el.setAttribute('playsinline', '');
+  el.setAttribute('webkit-playsinline', '');
+  el.preload = 'auto';
 }
 
 /** Caps GPU fill on phones; iPhone used 0.48 before — far below native res and looked soft. */
@@ -358,6 +362,10 @@ let graphicsInited = false;
 let graphicsLoadPromise = null;
 /** True after first `preloadGraphicsPipeline` + lobby presentation. */
 let lobbyGraphicsReady = false;
+/** Resolved when 3D + BGM + SFX are fetched and BGM element is decode-ready (before first Play). */
+let bootstrapAssetsPromise = null;
+/** True after `waitAudioElementReady` succeeds for BGM (avoids starting run on empty buffer). */
+let bgmLoadReady = false;
 /** Visual-only obstacles + coins down the track on the menu (not in `obstacles` / `coins`). */
 let lobbyBackdropDecorGroup = null;
 /** User already saw looping stretch on the menu; skip the post-Play intro. */
@@ -948,7 +956,10 @@ const SFX_PRELOAD_PATHS = {
   gameover: 'sounds/gameover.mp3',
 };
 
-function waitAudioElementReady(audioEl, timeoutMs = 12000) {
+function waitAudioElementReady(audioEl, timeoutMs) {
+  const cap =
+    timeoutMs ??
+    (preferMobilePerf() ? 28000 : 12000);
   return new Promise((resolve) => {
     let settled = false;
     const done = () => {
@@ -957,7 +968,7 @@ function waitAudioElementReady(audioEl, timeoutMs = 12000) {
       window.clearTimeout(tid);
       resolve();
     };
-    const tid = window.setTimeout(done, timeoutMs);
+    const tid = window.setTimeout(done, cap);
     if (audioEl.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
       done();
       return;
@@ -1015,7 +1026,7 @@ async function fetchAllSfxObjectUrls() {
 }
 
 function initCoinAudioPool() {
-  coinAudioPool = [];
+  if (coinAudioPool.length > 0) return;
   coinPoolIdx = 0;
   const url = sfxObjectUrls.coin;
   if (!url) return;
@@ -1637,15 +1648,43 @@ function startLobbyRenderLoop() {
   lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
 }
 
+/**
+ * Page-load: WebGL + player/coins + fetch/decode BGM and SFX before Play is enabled.
+ * Retries after failure by clearing `bootstrapAssetsPromise`.
+ */
 async function bootstrapLobbyGraphics() {
-  try {
-    await preloadGraphicsPipeline();
-    if (gameStarted) return;
-    startLobbyStretchPresentation();
-    startLobbyRenderLoop();
-  } catch (err) {
-    console.error('AstroRun: lobby 3D failed to load', err);
-  }
+  if (bootstrapAssetsPromise) return bootstrapAssetsPromise;
+  bootstrapAssetsPromise = (async () => {
+    try {
+      if (startStatusEl) startStatusEl.textContent = 'Loading 3D, music, and sounds…';
+      if (startBtnEl) {
+        startBtnEl.disabled = true;
+        startBtnEl.setAttribute('aria-busy', 'true');
+      }
+      await Promise.all([
+        preloadGraphicsPipeline(),
+        preloadAudioPipeline({ force: true }),
+      ]);
+      if (gameStarted) return;
+      initCoinAudioPool();
+      startLobbyStretchPresentation();
+      startLobbyRenderLoop();
+      if (startStatusEl) startStatusEl.textContent = '';
+    } catch (err) {
+      console.error('AstroRun: lobby bootstrap failed', err);
+      bootstrapAssetsPromise = null;
+      if (startStatusEl) {
+        startStatusEl.textContent = 'Could not load. Check connection and tap Play to retry.';
+      }
+      throw err;
+    } finally {
+      if (startBtnEl && !gameStarted) {
+        startBtnEl.disabled = false;
+        startBtnEl.setAttribute('aria-busy', 'false');
+      }
+    }
+  })();
+  return bootstrapAssetsPromise;
 }
 
 function startRunAnimationImmediately() {
@@ -3918,6 +3957,18 @@ function init() {
     }
   });
 
+  window.addEventListener(
+    'pageshow',
+    (e) => {
+      if (!e.persisted || !gameStarted || !alive) return;
+      syncBgmPlayState();
+      if (mobilePerf && runAudio && runGameplayActive && runAudio.paused) {
+        void runAudio.play().catch(() => {});
+      }
+    },
+    false,
+  );
+
   graphicsInited = true;
 }
 
@@ -4712,13 +4763,45 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
-/** Fetch + decode BGM and SFX (blob URLs, run loop clip). Does not start gameplay. */
-async function preloadAudioPipeline() {
+/** Loads run loop SFX into `runAudio` if missing or broken. */
+async function ensureRunAudioElement() {
+  const runUrl = sfxObjectUrls.run;
+  if (!runUrl) return;
+  if (runAudio && !runAudio.error) return;
+  runAudio = null;
+  const r = new Audio(runUrl);
+  r.loop = true;
+  r.preload = 'auto';
+  r.volume = 0.32;
+  prepareAudioElementForIOS(r);
+  await waitAudioElementReady(r);
+  if (!r.error) runAudio = r;
+}
+
+/**
+ * Fetch + decode BGM and SFX. Idempotent: does not tear down a working BGM element (fixes mobile cutouts
+ * when Play re-ran `preloadAudioPipeline` and revoked the blob URL). Use `{ force: true }` only for full reload.
+ */
+async function preloadAudioPipeline(opts = {}) {
+  const force = opts.force === true;
+  const bgmOk = !force && bgmAudio && !bgmAudio.error && bgmLoadReady;
+  if (bgmOk) {
+    if (Object.keys(sfxObjectUrls).length === 0) {
+      sfxObjectUrls = await fetchAllSfxObjectUrls();
+    }
+    await ensureRunAudioElement();
+    return;
+  }
+
   const bgmBlob = await fetchFirstWorkingBgmBlob();
   revokeAllSfxObjectUrls();
   sfxObjectUrls = await fetchAllSfxObjectUrls();
   revokeBgmBlobUrl();
   bgmAudio = null;
+  bgmLoadReady = false;
+  bgmAnalyser = null;
+  bgmFreqData = null;
+  bgmTunnelLowpass = null;
   if (bgmBlob) {
     bgmObjectUrl = URL.createObjectURL(bgmBlob);
     const a = new Audio(bgmObjectUrl);
@@ -4731,20 +4814,11 @@ async function preloadAudioPipeline() {
       revokeBgmBlobUrl();
     } else {
       bgmAudio = a;
+      bgmLoadReady = true;
       tryAttachBgmAnalyser();
     }
   }
-  runAudio = null;
-  const runUrl = sfxObjectUrls.run;
-  if (runUrl) {
-    const r = new Audio(runUrl);
-    r.loop = true;
-    r.preload = 'auto';
-    r.volume = 0.32;
-    prepareAudioElementForIOS(r);
-    await waitAudioElementReady(r);
-    if (!r.error) runAudio = r;
-  }
+  await ensureRunAudioElement();
 }
 
 /**
@@ -4787,20 +4861,13 @@ function wireStartScreen() {
   startBtnEl.addEventListener('touchstart', primeTouchAudio, { passive: true, capture: true });
   startBtnEl.addEventListener('click', async () => {
     if (gameStarted) return;
+    syncTouchGestureAudioUnlock();
     primeBgmAudioContext();
     startBtnEl.disabled = true;
+    startBtnEl.setAttribute('aria-busy', 'true');
     try {
-      if (!lobbyGraphicsReady) {
-        if (startStatusEl) startStatusEl.textContent = 'Loading 3D engine and audio…';
-        await Promise.all([preloadAudioPipeline(), preloadGraphicsPipeline()]);
-        if (!gameStarted) {
-          startLobbyStretchPresentation();
-          startLobbyRenderLoop();
-        }
-      } else {
-        if (startStatusEl) startStatusEl.textContent = 'Loading audio…';
-        await preloadAudioPipeline();
-      }
+      await bootstrapLobbyGraphics();
+      if (gameStarted) return;
       initCoinAudioPool();
       gameStarted = true;
       unlockBgm();
@@ -4810,11 +4877,12 @@ function wireStartScreen() {
       requestAnimationFrame(loop);
     } catch (err) {
       console.error('Game failed to start', err);
-      if (startStatusEl) {
+      if (startStatusEl && !startStatusEl.textContent) {
         startStatusEl.textContent =
           'Could not finish loading. Check your connection and tap Play again.';
       }
       startBtnEl.disabled = false;
+      startBtnEl.setAttribute('aria-busy', 'false');
       syncPlayCursor();
     }
   });
