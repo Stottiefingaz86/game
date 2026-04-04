@@ -8,16 +8,84 @@ const canvas = document.querySelector('#c');
 
 /** Append `?perf=1` to log avg/max ms per segment every 120 frames (mobile CPU debugging). */
 let perfHud = false;
+/** Top-right overlay: `?fps=1` or same as perf HUD when `?perf=1`. */
+let showFpsOverlay = false;
 try {
-  perfHud =
-    typeof location !== 'undefined' &&
-    /(?:^|[?&])perf=1(?:&|$)/.test(location.search || '');
+  const q = typeof location !== 'undefined' ? location.search || '' : '';
+  perfHud = /(?:^|[?&])perf=1(?:&|$)/.test(q);
+  showFpsOverlay = perfHud || /(?:^|[?&])fps=1(?:&|$)/.test(q);
 } catch {
   /* noop */
 }
+/** Toggle with F3 when URL flags are off (desktop-friendly). */
+let fpsDebugKeyToggle = false;
+function isFpsDebugActive() {
+  return perfHud || showFpsOverlay || fpsDebugKeyToggle;
+}
+
 let perfSampleN = 0;
 const perfAcc = { tick: 0, mid: 0, music: 0, holo: 0, render: 0, total: 0 };
 const perfMax = { tick: 0, mid: 0, music: 0, holo: 0, render: 0, total: 0 };
+
+const FPS_SPIKE_WIN = 48;
+const fpsSpikeBuf = new Float64Array(FPS_SPIKE_WIN);
+let fpsSpikeWrite = 0;
+let fpsSpikeCount = 0;
+let fpsEma = 60;
+let fpsPrevFrameStart = 0;
+
+function pushFpsWorkSpike(workMs) {
+  fpsSpikeBuf[fpsSpikeWrite] = workMs;
+  fpsSpikeWrite = (fpsSpikeWrite + 1) % FPS_SPIKE_WIN;
+  fpsSpikeCount = Math.min(fpsSpikeCount + 1, FPS_SPIKE_WIN);
+  let max = 0;
+  for (let i = 0; i < fpsSpikeCount; i++) {
+    if (fpsSpikeBuf[i] > max) max = fpsSpikeBuf[i];
+  }
+  return max;
+}
+
+function updateFpsDebugOverlay(frameGapMs, workMs, segs) {
+  const mainEl = document.getElementById('fps-debug-main');
+  const workEl = document.getElementById('fps-debug-work');
+  const splitEl = document.getElementById('fps-debug-split');
+  const rootEl = document.getElementById('fps-debug');
+  if (!mainEl || !rootEl) return;
+
+  const gap = Math.max(0.001, frameGapMs);
+  const instFps = 1000 / gap;
+  fpsEma += (instFps - fpsEma) * 0.1;
+  const spike = pushFpsWorkSpike(workMs);
+
+  mainEl.textContent = `${fpsEma.toFixed(0)} fps · ${gap.toFixed(1)}ms gap`;
+  if (workEl) {
+    workEl.textContent = `work ${workMs.toFixed(1)}ms · spike ${spike.toFixed(0)}ms`;
+  }
+  if (splitEl) {
+    if (segs) {
+      const sim = segs.tick + segs.mid + segs.music + segs.holo;
+      splitEl.textContent = `sim ${sim.toFixed(1)} · GL ${segs.render.toFixed(1)}`;
+    } else {
+      splitEl.textContent = '';
+    }
+  }
+
+  rootEl.classList.remove('fps-debug--warn', 'fps-debug--bad');
+  if (fpsEma < 36 || gap > 30) rootEl.classList.add('fps-debug--bad');
+  else if (fpsEma < 50 || gap > 22) rootEl.classList.add('fps-debug--warn');
+}
+
+function syncFpsDebugVisibility() {
+  const rootEl = document.getElementById('fps-debug');
+  if (!rootEl || !isFpsDebugActive()) return;
+  const inLobby = lobbyGraphicsReady && !gameStarted;
+  const inRunHud = document.body?.classList.contains('game-running') === true;
+  /** Start intro uses `runGameplayActive === false` so `game-running` is off; still show FPS. */
+  const inStartIntro =
+    gameStarted && alive && introCameraActive && !runGameplayActive;
+  const show = graphicsInited && (inLobby || inRunHud || inStartIntro);
+  rootEl.classList.toggle('fps-debug--visible', show);
+}
 
 /** Cached `index.html` on CDNs/phones may still contain the old dock; new JS removes it. */
 document.getElementById('mobile-controls')?.remove();
@@ -34,6 +102,7 @@ function syncPlayCursor() {
     (overlay && !overlay.classList.contains('hidden'));
   document.body.classList.toggle('game-running', inActiveRun);
   document.body.classList.toggle('menu-cursor', menuCursor);
+  if (isFpsDebugActive()) syncFpsDebugVisibility();
 }
 
 function closeStartInstructionsModal() {
@@ -469,21 +538,21 @@ let duckAmount = 0;
 /** Max meters behind `furthestDistance` (best forward progress this run). */
 const RUN_BACKWARD_MAX_METERS = 10;
 /**
- * Boost pad: launch tuned so apex clears tunnel roof (`roofTopY` ~4.4–5.5 m; peak ≈ vy²/90 with GRAVITY -45).
- * Forward surge stays on `BOOST_SPEED_MULT`, not height.
+ * Boost pad: vertical impulse clears tunnel ceiling for roof landing (bodyTop peak ≈ 1.89 + vy²/90 vs
+ * ceilBottomY ~4.3–5.3). Between the weak (18) and excessive (36) extremes. Forward bump stays mild.
  */
-const BOOST_PAD_VY = 24;
-const BOOST_SPEED_MULT = 2.72;
-const BOOST_SPEED_SEC = 1.5;
+const BOOST_PAD_VY = 26;
+const BOOST_SPEED_MULT = 1.32;
+const BOOST_SPEED_SEC = 0.95;
 /** Jump pad length along Z; keep collision `padHalfD` in sync. */
 const BOOST_PAD_DEPTH = 2.85;
-/** After a jump pad, base run speed bonus climbs faster for a few seconds. */
-const BOOST_PAD_ACCEL_SEC = 3.75;
-const BOOST_PAD_EXTRA_BONUS_RATE = 12;
+/** After a jump pad, base run speed bonus climbs a bit faster for a short window. */
+const BOOST_PAD_ACCEL_SEC = 2.2;
+const BOOST_PAD_EXTRA_BONUS_RATE = 4.5;
 /** Ramps up along +Z (front lip); keep in sync with `makeCurvedJumpPadGeometry`. */
 const BOOST_PAD_MAX_LIFT = 0.27;
 
-/** Ground speed-only pad (red / pink); long strip like Wipeout — keep `powerHalfD` in sync. */
+/** Ground speed-only pad (orange); long strip like Wipeout — keep `powerHalfD` in sync. */
 const POWER_PAD_DEPTH = 7.2;
 const POWER_SPEED_MULT = 1.92;
 const POWER_SPEED_SEC = 1.85;
@@ -1695,23 +1764,55 @@ function lobbyLoop() {
     lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
     return;
   }
+  const needTimings = isFpsDebugActive();
+  const wallStart = performance.now();
+  const frameGapMs = fpsPrevFrameStart ? wallStart - fpsPrevFrameStart : 16.67;
+  fpsPrevFrameStart = wallStart;
+
   renderFrameIndex += 1;
   const dt = Math.min(0.05, gameLoopClock.getDelta());
   holoTime += dt;
+  let t0;
+  let t1;
+  let t2;
+  let t3;
+  let t4;
+  if (needTimings) t0 = performance.now();
   ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
   if (playerGroup) playerGroup.position.z = LOBBY_RUNNER_ANCHOR_Z;
   applyLobbyCameraPose();
   if (playerMixer) {
     playerMixer.update(dt);
   }
+  if (needTimings) t1 = performance.now();
   if (lobbyBackdropDecorGroup) {
     lobbyBackdropDecorGroup.traverse((o) => {
       if (o.userData?.lobbySpinCoin) o.rotation.y += dt * 3.1;
     });
   }
   updateMusicReactiveVisuals(dt);
+  if (needTimings) t2 = performance.now();
   syncHologramTimeUniforms(holoTime);
+  if (needTimings) t3 = performance.now();
   renderer.render(scene, camera);
+  if (needTimings) t4 = performance.now();
+
+  if (isFpsDebugActive()) {
+    const workMs = needTimings ? t4 - t0 : 0;
+    const lobbySim = needTimings ? t1 - t0 : 0;
+    const spinMs = needTimings ? t2 - t1 : 0;
+    const holoMs = needTimings ? t3 - t2 : 0;
+    const glMs = needTimings ? t4 - t3 : 0;
+    updateFpsDebugOverlay(frameGapMs, workMs, {
+      tick: lobbySim,
+      mid: spinMs,
+      music: 0,
+      holo: holoMs,
+      render: glMs,
+    });
+    syncFpsDebugVisibility();
+  }
+
   lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
 }
 
@@ -3263,8 +3364,8 @@ function makePowerPadMaterial() {
     uniforms: {
       uTime: { value: 0 },
       uUsed: { value: 0 },
-      uColorDeep: { value: new THREE.Color(0x9a0028) },
-      uColorPink: { value: new THREE.Color(0xff8ec8) },
+      uColorDeep: { value: new THREE.Color(0x8a3a00) },
+      uColorPink: { value: new THREE.Color(0xffa64d) },
     },
     vertexShader: BOOST_VS,
     fragmentShader: POWER_FS,
@@ -4348,6 +4449,12 @@ function shiftLaneFromInput(dir) {
 }
 
 function onKeyDown(e) {
+  if (e.code === 'F3' && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    fpsDebugKeyToggle = !fpsDebugKeyToggle;
+    syncFpsDebugVisibility();
+    return;
+  }
   if (!gameStarted) return;
   unlockBgm();
   // Screen-left / screen-right match world X when camera is behind the runner (+Z forward).
@@ -5100,6 +5207,11 @@ function tick(dt) {
 function loop() {
   if (!graphicsInited || !renderer) return;
   if (gameStarted) stopLobbyRenderLoop();
+  const needTimings = isFpsDebugActive();
+  const wallStart = performance.now();
+  const frameGapMs = fpsPrevFrameStart ? wallStart - fpsPrevFrameStart : 16.67;
+  fpsPrevFrameStart = wallStart;
+
   renderFrameIndex += 1;
   const dt = Math.min(0.05, gameLoopClock.getDelta());
   holoTime += dt;
@@ -5108,10 +5220,10 @@ function loop() {
   let perfT2;
   let perfT3;
   let perfT4;
-  if (perfHud) perfT0 = performance.now();
+  if (needTimings) perfT0 = performance.now();
   const wasAliveBeforeTick = alive;
   tick(dt);
-  if (perfHud) perfT1 = performance.now();
+  if (needTimings) perfT1 = performance.now();
   if (gameStarted && !alive && !wasAliveBeforeTick) {
     if (landShakeMag > 0.006) {
       decayLandShake(dt);
@@ -5133,13 +5245,13 @@ function loop() {
   }
   updateBgmPlayback(dt);
   updateRunSfx(dt);
-  if (perfHud) perfT2 = performance.now();
+  if (needTimings) perfT2 = performance.now();
   updateMusicReactiveVisuals(dt);
-  if (perfHud) perfT3 = performance.now();
+  if (needTimings) perfT3 = performance.now();
   syncHologramTimeUniforms(holoTime);
-  if (perfHud) perfT4 = performance.now();
+  if (needTimings) perfT4 = performance.now();
   renderer.render(scene, camera);
-  if (perfHud) {
+  if (needTimings) {
     const perfT5 = performance.now();
     const tickMs = perfT1 - perfT0;
     const midMs = perfT2 - perfT1;
@@ -5147,33 +5259,45 @@ function loop() {
     const holoMs = perfT4 - perfT3;
     const renderMs = perfT5 - perfT4;
     const totalMs = perfT5 - perfT0;
-    perfSampleN += 1;
-    perfAcc.tick += tickMs;
-    perfAcc.mid += midMs;
-    perfAcc.music += musicMs;
-    perfAcc.holo += holoMs;
-    perfAcc.render += renderMs;
-    perfAcc.total += totalMs;
-    perfMax.tick = Math.max(perfMax.tick, tickMs);
-    perfMax.mid = Math.max(perfMax.mid, midMs);
-    perfMax.music = Math.max(perfMax.music, musicMs);
-    perfMax.holo = Math.max(perfMax.holo, holoMs);
-    perfMax.render = Math.max(perfMax.render, renderMs);
-    perfMax.total = Math.max(perfMax.total, totalMs);
-    if (perfSampleN >= 120) {
-      const n = perfSampleN;
-      console.info('[AstroRun perf] avg ms / frame (last ' + n + 'f)', {
-        tick: (perfAcc.tick / n).toFixed(2),
-        mid: (perfAcc.mid / n).toFixed(2),
-        music: (perfAcc.music / n).toFixed(2),
-        holoSync: (perfAcc.holo / n).toFixed(2),
-        render: (perfAcc.render / n).toFixed(2),
-        total: (perfAcc.total / n).toFixed(2),
+    if (perfHud) {
+      perfSampleN += 1;
+      perfAcc.tick += tickMs;
+      perfAcc.mid += midMs;
+      perfAcc.music += musicMs;
+      perfAcc.holo += holoMs;
+      perfAcc.render += renderMs;
+      perfAcc.total += totalMs;
+      perfMax.tick = Math.max(perfMax.tick, tickMs);
+      perfMax.mid = Math.max(perfMax.mid, midMs);
+      perfMax.music = Math.max(perfMax.music, musicMs);
+      perfMax.holo = Math.max(perfMax.holo, holoMs);
+      perfMax.render = Math.max(perfMax.render, renderMs);
+      perfMax.total = Math.max(perfMax.total, totalMs);
+      if (perfSampleN >= 120) {
+        const n = perfSampleN;
+        console.info('[AstroRun perf] avg ms / frame (last ' + n + 'f)', {
+          tick: (perfAcc.tick / n).toFixed(2),
+          mid: (perfAcc.mid / n).toFixed(2),
+          music: (perfAcc.music / n).toFixed(2),
+          holoSync: (perfAcc.holo / n).toFixed(2),
+          render: (perfAcc.render / n).toFixed(2),
+          total: (perfAcc.total / n).toFixed(2),
+        });
+        console.info('[AstroRun perf] max ms (same window)', { ...perfMax });
+        perfSampleN = 0;
+        perfAcc.tick = perfAcc.mid = perfAcc.music = perfAcc.holo = perfAcc.render = perfAcc.total = 0;
+        perfMax.tick = perfMax.mid = perfMax.music = perfMax.holo = perfMax.render = perfMax.total = 0;
+      }
+    }
+    if (isFpsDebugActive()) {
+      updateFpsDebugOverlay(frameGapMs, totalMs, {
+        tick: tickMs,
+        mid: midMs,
+        music: musicMs,
+        holo: holoMs,
+        render: renderMs,
       });
-      console.info('[AstroRun perf] max ms (same window)', { ...perfMax });
-      perfSampleN = 0;
-      perfAcc.tick = perfAcc.mid = perfAcc.music = perfAcc.holo = perfAcc.render = perfAcc.total = 0;
-      perfMax.tick = perfMax.mid = perfMax.music = perfMax.holo = perfMax.render = perfMax.total = 0;
+      syncFpsDebugVisibility();
     }
   }
   requestAnimationFrame(loop);

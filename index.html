@@ -119,6 +119,13 @@
       </div>
     </div>
     <canvas id="c"></canvas>
+    <!-- Outside #ui so z-index is not capped below #start-screen (lobby/menu). -->
+    <div id="fps-debug" class="fps-debug" aria-hidden="true">
+      <div id="fps-debug-main" class="fps-debug-main">—</div>
+      <div id="fps-debug-work" class="fps-debug-work"></div>
+      <div id="fps-debug-split" class="fps-debug-split"></div>
+      <p class="fps-debug-hint">F3 · ?fps=1 · sim=JS · GL=draw</p>
+    </div>
     <script type="module" src="./src/main.js"></script>
   </body>
 </html>
