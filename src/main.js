@@ -35,6 +35,7 @@ function wireMobileTouchControls() {
   };
   left?.addEventListener('pointerdown', (e) => {
     absorb(e);
+    syncTouchGestureAudioUnlock();
     try {
       canvas.focus({ preventScroll: true });
     } catch {
@@ -46,6 +47,7 @@ function wireMobileTouchControls() {
   });
   right?.addEventListener('pointerdown', (e) => {
     absorb(e);
+    syncTouchGestureAudioUnlock();
     try {
       canvas.focus({ preventScroll: true });
     } catch {
@@ -57,6 +59,7 @@ function wireMobileTouchControls() {
   });
   jump?.addEventListener('pointerdown', (e) => {
     absorb(e);
+    syncTouchGestureAudioUnlock();
     unlockBgm();
     if (!gameStarted) return;
     if (!alive) {
@@ -67,6 +70,7 @@ function wireMobileTouchControls() {
   });
   const backDown = (e) => {
     absorb(e);
+    syncTouchGestureAudioUnlock();
     unlockBgm();
     if (!gameStarted || !alive || !runGameplayActive) return;
     runBackwardHeld = true;
@@ -302,7 +306,37 @@ function prepareAudioElementForIOS(el) {
 /** Caps GPU fill on phones without penalizing iPad `mobilePerf` as much. */
 function gamePixelRatioCap() {
   if (!mobilePerf) return 1.5;
-  return isIPhoneOrIPod() ? 0.72 : 0.88;
+  return isIPhoneOrIPod() ? 0.55 : 0.78;
+}
+
+/** iOS/WebKit: HTMLAudio play() after `await` is not a user gesture — unlock in pointerdown/touchstart. */
+let htmlAudioSessionUnlocked = false;
+function syncTouchGestureAudioUnlock() {
+  if (htmlAudioSessionUnlocked) return;
+  try {
+    const a = new Audio(
+      'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==',
+    );
+    prepareAudioElementForIOS(a);
+    a.volume = 0;
+    const p = a.play();
+    if (p) {
+      void p
+        .then(() => {
+          try {
+            a.pause();
+          } catch {
+            /* ignore */
+          }
+          htmlAudioSessionUnlocked = true;
+        })
+        .catch(() => {});
+    } else {
+      htmlAudioSessionUnlocked = true;
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 let scene, camera, renderer;
@@ -608,34 +642,16 @@ let bgmIntroFadeDuration = 2.4;
 let difficultyRampT = 0;
 
 function makeRunwaySlabShaderMaterial() {
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uScroll: { value: 0 },
-      uTime: { value: 0 },
-      uPulse: { value: 0 },
-      uImpact: { value: 0 },
-      uLaneW: { value: LANE_WIDTH },
-      uCyan: { value: new THREE.Color(0x00f5ff) },
-      uMagenta: { value: new THREE.Color(0xff0a78) },
-      uVoid: { value: new THREE.Color(0x030009) },
-      uEnvMap: { value: null },
-      uCamPos: { value: new THREE.Vector3() },
-      uEnvIntensity: { value: mobilePerf ? 1.02 : 1.58 },
-      uFootFlash: { value: 0 },
-      uPlayerX: { value: 0 },
-      uPlayerZ: { value: 0 },
-      uFogNear: { value: 32 },
-      uFogFar: { value: 108 },
-      uFogColor: { value: new THREE.Color(0x281845) },
-      uTunnelFloorBright: { value: 0 },
-    },
-    fog: false,
-    transparent: false,
-    depthWrite: true,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
-    vertexShader: `
+  if (mobilePerf) {
+    const m = new THREE.MeshBasicMaterial({
+      color: 0x3a2258,
+      fog: true,
+    });
+    m.userData.mobileRunwayBasic = true;
+    return m;
+  }
+
+  const runwayVertexShader = `
       varying vec3 vWPos;
       varying vec3 vWorldNormal;
       void main() {
@@ -644,7 +660,40 @@ function makeRunwaySlabShaderMaterial() {
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
         gl_Position = projectionMatrix * viewMatrix * wp;
       }
-    `,
+    `;
+
+  const baseUniforms = {
+    uScroll: { value: 0 },
+    uTime: { value: 0 },
+    uPulse: { value: 0 },
+    uImpact: { value: 0 },
+    uLaneW: { value: LANE_WIDTH },
+    uCyan: { value: new THREE.Color(0x00f5ff) },
+    uMagenta: { value: new THREE.Color(0xff0a78) },
+    uVoid: { value: new THREE.Color(0x030009) },
+    uCamPos: { value: new THREE.Vector3() },
+    uFootFlash: { value: 0 },
+    uPlayerX: { value: 0 },
+    uPlayerZ: { value: 0 },
+    uFogNear: { value: 32 },
+    uFogFar: { value: 108 },
+    uFogColor: { value: new THREE.Color(0x281845) },
+    uTunnelFloorBright: { value: 0 },
+  };
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      ...baseUniforms,
+      uEnvMap: { value: null },
+      uEnvIntensity: { value: 1.58 },
+    },
+    fog: false,
+    transparent: false,
+    depthWrite: true,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
+    vertexShader: runwayVertexShader,
     fragmentShader: `
       varying vec3 vWPos;
       varying vec3 vWorldNormal;
@@ -785,7 +834,7 @@ function ensureRunwayMaterials() {
   if (runwaySlabMat) return;
 
   runwaySlabMat = makeRunwaySlabShaderMaterial();
-  if (scene?.environment) {
+  if (scene?.environment && runwaySlabMat.uniforms.uEnvMap) {
     runwaySlabMat.uniforms.uEnvMap.value = scene.environment;
   }
 }
@@ -1018,6 +1067,12 @@ function unlockBgm() {
     }
   }
   syncBgmPlayState();
+  if (preferMobilePerf()) {
+    requestAnimationFrame(() => {
+      syncBgmPlayState();
+      if (runAudio && runGameplayActive && alive) void runAudio.play().catch(() => {});
+    });
+  }
 }
 
 function updateBgmPlayback(dt) {
@@ -1857,6 +1912,10 @@ function playPlayerJumpAnimation() {
  */
 function setupImageBasedLighting() {
   if (!renderer || !scene) return;
+  if (mobilePerf) {
+    scene.environment = null;
+    return;
+  }
   const pmrem = new THREE.PMREMGenerator(renderer);
   pmrem.compileEquirectangularShader();
   const envScene = new RoomEnvironment();
@@ -1869,8 +1928,12 @@ function enhancePlayerGltfMaterials(root) {
   root.traverse((o) => {
     if (!o.isMesh) return;
     const mats = Array.isArray(o.material) ? o.material : [o.material];
+    const out = [];
     for (const m of mats) {
-      if (!m) continue;
+      if (!m) {
+        out.push(m);
+        continue;
+      }
       if (m.map) {
         m.map.colorSpace = THREE.SRGBColorSpace;
         m.map.needsUpdate = true;
@@ -1879,8 +1942,29 @@ function enhancePlayerGltfMaterials(root) {
         m.emissiveMap.colorSpace = THREE.SRGBColorSpace;
         m.emissiveMap.needsUpdate = true;
       }
+      if (
+        mobilePerf &&
+        (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial || m.isMeshPhongMaterial || m.isMeshLambertMaterial)
+      ) {
+        const col = m.color?.clone?.() ?? new THREE.Color(0xffffff);
+        if (m.emissive && m.emissive.getHex() !== 0) {
+          col.lerp(m.emissive, Math.min(0.85, (m.emissiveIntensity ?? 0.35) * 0.9));
+        }
+        const nb = new THREE.MeshBasicMaterial({
+          map: m.map || null,
+          color: col,
+          transparent: m.transparent,
+          opacity: m.opacity,
+          side: m.side,
+          alphaMap: m.alphaMap || null,
+          fog: false,
+        });
+        m.dispose();
+        out.push(nb);
+        continue;
+      }
       if (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial) {
-        m.envMapIntensity = 1.35;
+        m.envMapIntensity = mobilePerf ? 0.22 : 1.35;
         m.fog = false;
         if (m.map) {
           if (m.metalness >= 0.95) m.metalness = 0.08;
@@ -1888,7 +1972,9 @@ function enhancePlayerGltfMaterials(root) {
         }
         m.needsUpdate = true;
       }
+      out.push(m);
     }
+    o.material = Array.isArray(o.material) ? out : out[0];
   });
 }
 
@@ -2263,16 +2349,20 @@ async function loadAndApplyPlayerCharacter() {
 
 function makeBlockPlayer() {
   const g = new THREE.Group();
-  const matBody = new THREE.MeshPhongMaterial({
-    color: 0x4ecdc4,
-    shininess: 35,
-    specular: 0x224444,
-  });
-  const matAccent = new THREE.MeshPhongMaterial({
-    color: 0xff6b6b,
-    shininess: 25,
-    specular: 0x442222,
-  });
+  const matBody = mobilePerf
+    ? new THREE.MeshBasicMaterial({ color: 0x4ecdc4, fog: true })
+    : new THREE.MeshPhongMaterial({
+        color: 0x4ecdc4,
+        shininess: 35,
+        specular: 0x224444,
+      });
+  const matAccent = mobilePerf
+    ? new THREE.MeshBasicMaterial({ color: 0xff6b6b, fog: true })
+    : new THREE.MeshPhongMaterial({
+        color: 0xff6b6b,
+        shininess: 25,
+        specular: 0x442222,
+      });
   const torso = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.65, 0.35), matBody);
   torso.position.y = 0.85;
   g.add(torso);
@@ -2443,6 +2533,19 @@ function makeTunnelStripe(z0, length) {
   return g;
 }
 
+/** Mobile: unlit only — no hologram shaders, no additive “bloom” stacks. */
+function makeMobileFlatHoloMaterial(coreColor, edgeColor, opacity) {
+  const c = coreColor.clone().lerp(edgeColor, 0.5);
+  return new THREE.MeshBasicMaterial({
+    color: c,
+    transparent: true,
+    opacity: THREE.MathUtils.clamp(opacity, 0.22, 0.88),
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    fog: true,
+  });
+}
+
 const HOLO_BOX_VS = `
   varying vec3 vNormal;
   varying vec3 vViewDir;
@@ -2587,6 +2690,11 @@ const TUNNEL_NEON_FS = `
 `;
 
 function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, phase = 0) {
+  if (mobilePerf) {
+    const mat = makeMobileFlatHoloMaterial(coreColor, edgeColor, alpha + 0.22);
+    mat.userData.tunnelNeon = true;
+    return mat;
+  }
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2613,6 +2721,7 @@ function syncTunnelNeonUniforms(dt) {
   const inside = getTunnelStripeAtZ(distance) != null;
   const k = 1 - Math.exp(-dt * (inside ? 5.8 : 3.2));
   tunnelRunLightEase = THREE.MathUtils.lerp(tunnelRunLightEase, inside ? 1 : 0, k);
+  if (mobilePerf) return;
   if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
     runwaySlabMat.uniforms.uTunnelFloorBright.value = tunnelRunLightEase;
   }
@@ -2630,6 +2739,9 @@ function syncTunnelNeonUniforms(dt) {
 }
 
 function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, phase = 0) {
+  if (mobilePerf) {
+    return makeMobileFlatHoloMaterial(coreColor, edgeColor, alpha * 0.9 + 0.14);
+  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2705,6 +2817,19 @@ const BOOST_FS = `
 `;
 
 function makeBoostHologramMaterial(isDecoy = false) {
+  if (mobilePerf) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: isDecoy ? 0x3a5562 : 0x44eeff,
+      transparent: true,
+      opacity: isDecoy ? 0.4 : 0.64,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: true,
+    });
+    mat.userData.mobileBoostPad = true;
+    mat.userData.mobileDecoyBoost = isDecoy;
+    return mat;
+  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2751,6 +2876,18 @@ const POWER_FS = `
 `;
 
 function makePowerPadMaterial() {
+  if (mobilePerf) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xff6ba8,
+      transparent: true,
+      opacity: 0.7,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: true,
+    });
+    mat.userData.mobilePowerPad = true;
+    return mat;
+  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2802,14 +2939,31 @@ function makeCurvedJumpPadGeometry(w, d, sx = 10, sz = 16) {
 function setPadUsedUniform(root, used) {
   root.traverse((obj) => {
     const m = obj.material;
-    if (!m?.uniforms?.uUsed) return;
-    m.uniforms.uUsed.value = used;
+    if (!m) return;
+    if (m.uniforms?.uUsed != null) {
+      m.uniforms.uUsed.value = used;
+      return;
+    }
+    if (m.userData?.mobileBoostPad) {
+      if (m.userData.mobileDecoyBoost) {
+        m.color.set(used ? 0x2a3840 : 0x3a5562);
+        m.opacity = used ? 0.22 : 0.4;
+      } else {
+        m.color.set(used ? 0x1a3540 : 0x44eeff);
+        m.opacity = used ? 0.24 : 0.64;
+      }
+      return;
+    }
+    if (m.userData?.mobilePowerPad) {
+      m.color.set(used ? 0x5a2048 : 0xff6ba8);
+      m.opacity = used ? 0.32 : 0.7;
+    }
   });
 }
 
 function syncHologramTimeUniforms(t) {
   if (!scene) return;
-  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
+  if (mobilePerf) return;
   scene.traverse((obj) => {
     const m = obj.material;
     if (!m) return;
@@ -3369,8 +3523,27 @@ function createMusicBackdrop() {
   musicBackdropGroup = new THREE.Group();
   musicBackdropGroup.name = 'musicBackdrop';
 
-  const skySegs = mobilePerf ? 10 : 20;
-  const skyRings = mobilePerf ? 6 : 14;
+  if (mobilePerf) {
+    const skyGeoM = new THREE.SphereGeometry(120, 6, 4);
+    musicSkyMaterial = new THREE.MeshBasicMaterial({
+      color: 0x1a0a2a,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: true,
+    });
+    musicSkyMaterial.userData.mobileBackdropSky = true;
+    const skyMeshM = new THREE.Mesh(skyGeoM, musicSkyMaterial);
+    skyMeshM.renderOrder = -500;
+    musicBackdropGroup.add(skyMeshM);
+    musicGridFloorMaterial = null;
+    musicGridCeilingMaterial = null;
+    musicStarsMaterial = null;
+    scene.add(musicBackdropGroup);
+    return;
+  }
+
+  const skySegs = 20;
+  const skyRings = 14;
   const skyGeo = new THREE.SphereGeometry(145, skySegs, skyRings);
   musicSkyMaterial = new THREE.ShaderMaterial({
     uniforms: {
@@ -3442,8 +3615,8 @@ function createMusicBackdrop() {
   skyMesh.renderOrder = -500;
   musicBackdropGroup.add(skyMesh);
 
-  const gridW = mobilePerf ? 168 : 290;
-  const gridD = mobilePerf ? 280 : 440;
+  const gridW = 290;
+  const gridD = 440;
   const floorGeo = new THREE.PlaneGeometry(gridW, gridD, 1, 1);
   musicGridFloorMaterial = makeNeonGridShaderMaterial(false);
   const floor = new THREE.Mesh(floorGeo, musicGridFloorMaterial);
@@ -3452,18 +3625,14 @@ function createMusicBackdrop() {
   floor.renderOrder = -480;
   musicBackdropGroup.add(floor);
 
-  if (!mobilePerf) {
-    musicGridCeilingMaterial = makeNeonGridShaderMaterial(true);
-    const ceil = new THREE.Mesh(floorGeo.clone(), musicGridCeilingMaterial);
-    ceil.rotation.x = Math.PI / 2;
-    ceil.position.set(0, 38, gridD * 0.38);
-    ceil.renderOrder = -480;
-    musicBackdropGroup.add(ceil);
-  } else {
-    musicGridCeilingMaterial = null;
-  }
+  musicGridCeilingMaterial = makeNeonGridShaderMaterial(true);
+  const ceil = new THREE.Mesh(floorGeo.clone(), musicGridCeilingMaterial);
+  ceil.rotation.x = Math.PI / 2;
+  ceil.position.set(0, 38, gridD * 0.38);
+  ceil.renderOrder = -480;
+  musicBackdropGroup.add(ceil);
 
-  const starN = mobilePerf ? 52 : 198;
+  const starN = 198;
   const starPos = new Float32Array(starN * 3);
   for (let i = 0; i < starN; i++) {
     starPos[i * 3] = (Math.random() - 0.5) * 168;
@@ -3474,7 +3643,7 @@ function createMusicBackdrop() {
   starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
   musicStarsMaterial = new THREE.PointsMaterial({
     color: 0xffb8fc,
-    size: mobilePerf ? 0.17 : 0.22,
+    size: 0.22,
     transparent: true,
     opacity: 0.92,
     sizeAttenuation: true,
@@ -3510,33 +3679,46 @@ function updateMusicReactiveVisuals(dt) {
   const colorK = 1 - Math.exp(-dt * 2.4);
 
   if (musicSkyMaterial) {
-    const tgtPulse = bass * aliveBoost;
-    musicSkyMaterial.uniforms.uPulse.value = THREE.MathUtils.lerp(
-      musicSkyMaterial.uniforms.uPulse.value,
-      tgtPulse,
-      0.07,
-    );
-    musicSkyMaterial.uniforms.uShimmer.value = musicPulseTime * (1.22 + mid * 2.35 + bass * 0.58);
-    musicSkyMaterial.uniforms.uMid.value = mid * aliveBoost;
-    musicSkyMaterial.uniforms.uHigh.value = high * aliveBoost;
-    musicSkyMaterial.uniforms.uFlow.value = musicPulseTime;
+    if (musicSkyMaterial.uniforms) {
+      const tgtPulse = bass * aliveBoost;
+      musicSkyMaterial.uniforms.uPulse.value = THREE.MathUtils.lerp(
+        musicSkyMaterial.uniforms.uPulse.value,
+        tgtPulse,
+        0.07,
+      );
+      musicSkyMaterial.uniforms.uShimmer.value = musicPulseTime * (1.22 + mid * 2.35 + bass * 0.58);
+      musicSkyMaterial.uniforms.uMid.value = mid * aliveBoost;
+      musicSkyMaterial.uniforms.uHigh.value = high * aliveBoost;
+      musicSkyMaterial.uniforms.uFlow.value = musicPulseTime;
 
-    tmpMusicColor.setHSL(
-      (0.91 + bass * 0.018 + mid * 0.012) % 1,
-      1,
-      0.46 + high * 0.05,
-    );
-    musicSkyMaterial.uniforms.uMagenta.value.lerp(tmpMusicColor, colorK);
-    tmpMusicColor.setHSL((0.5 + mid * 0.04) % 1, 0.95, 0.48 + bass * 0.055);
-    musicSkyMaterial.uniforms.uCyan.value.lerp(tmpMusicColor, colorK);
-    tmpMusicColor.setRGB(0.02 + bass * 0.012, 0.008 + mid * 0.014, 0.048 + mid * 0.02);
-    musicSkyMaterial.uniforms.uVoid.value.lerp(tmpMusicColor, colorK);
+      tmpMusicColor.setHSL(
+        (0.91 + bass * 0.018 + mid * 0.012) % 1,
+        1,
+        0.46 + high * 0.05,
+      );
+      musicSkyMaterial.uniforms.uMagenta.value.lerp(tmpMusicColor, colorK);
+      tmpMusicColor.setHSL((0.5 + mid * 0.04) % 1, 0.95, 0.48 + bass * 0.055);
+      musicSkyMaterial.uniforms.uCyan.value.lerp(tmpMusicColor, colorK);
+      tmpMusicColor.setRGB(0.02 + bass * 0.012, 0.008 + mid * 0.014, 0.048 + mid * 0.02);
+      musicSkyMaterial.uniforms.uVoid.value.lerp(tmpMusicColor, colorK);
+    } else if (musicSkyMaterial.userData.mobileBackdropSky) {
+      tmpMusicColor.setHSL(
+        (0.86 + bass * 0.06 + mid * 0.04) % 1,
+        0.42 + mid * 0.28,
+        0.1 + high * 0.08 + bass * 0.06,
+      );
+      musicSkyMaterial.color.lerp(tmpMusicColor, colorK);
+    }
   }
 
-  if (runwaySlabMat?.uniforms?.uCyan && musicSkyMaterial) {
+  if (runwaySlabMat?.uniforms?.uCyan && musicSkyMaterial?.uniforms) {
     runwaySlabMat.uniforms.uCyan.value.copy(musicSkyMaterial.uniforms.uCyan.value);
     runwaySlabMat.uniforms.uMagenta.value.copy(musicSkyMaterial.uniforms.uMagenta.value);
     runwaySlabMat.uniforms.uVoid.value.copy(musicSkyMaterial.uniforms.uVoid.value);
+  }
+  if (runwaySlabMat?.userData?.mobileRunwayBasic && musicSkyMaterial?.userData?.mobileBackdropSky) {
+    tmpMusicColor.copy(musicSkyMaterial.color).multiplyScalar(0.58);
+    runwaySlabMat.color.lerp(tmpMusicColor, colorK);
   }
   if (runwaySlabMat?.uniforms?.uFogNear && scene?.fog?.isFog) {
     const f = scene.fog;
@@ -3570,7 +3752,11 @@ function updateMusicReactiveVisuals(dt) {
     if (camera && runwaySlabMat.uniforms.uCamPos) {
       runwaySlabMat.uniforms.uCamPos.value.copy(camera.position);
     }
-    if (scene?.environment && runwaySlabMat.uniforms.uEnvMap && !runwaySlabMat.uniforms.uEnvMap.value) {
+    if (
+      scene?.environment &&
+      runwaySlabMat.uniforms.uEnvMap &&
+      !runwaySlabMat.uniforms.uEnvMap.value
+    ) {
       runwaySlabMat.uniforms.uEnvMap.value = scene.environment;
     }
     if (playerGroup) {
@@ -3602,7 +3788,7 @@ function updateMusicReactiveVisuals(dt) {
   }
 
   if (musicStarsMaterial) {
-    const starT = (mobilePerf ? 0.17 : 0.22) + high * 0.06 * aliveBoost + bass * 0.03;
+    const starT = 0.22 + high * 0.06 * aliveBoost + bass * 0.03;
     musicStarsMaterial.size = THREE.MathUtils.lerp(musicStarsMaterial.size, starT, 1 - Math.exp(-dt * 3.5));
   }
 
@@ -4584,6 +4770,9 @@ async function preloadGraphicsPipeline() {
 
 function wireStartScreen() {
   if (!startBtnEl || !startScreenEl) return;
+  const primeTouchAudio = () => syncTouchGestureAudioUnlock();
+  startBtnEl.addEventListener('pointerdown', primeTouchAudio, { capture: true });
+  startBtnEl.addEventListener('touchstart', primeTouchAudio, { passive: true, capture: true });
   startBtnEl.addEventListener('click', async () => {
     if (gameStarted) return;
     primeBgmAudioContext();
