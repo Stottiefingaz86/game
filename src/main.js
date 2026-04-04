@@ -289,6 +289,22 @@ function preferMobileOnScreenControls() {
   return narrow && coarse;
 }
 
+/** iPhone / iPod: tight GPU memory and fragile WebGL precompile; treat differently from iPad. */
+function isIPhoneOrIPod() {
+  return /iPhone|iPod/.test(navigator.userAgent || '');
+}
+
+/** iOS Safari (and WebKit) expects this on `<audio>` for reliable inline / gesture-unlocked playback. */
+function prepareAudioElementForIOS(el) {
+  if (el && 'playsInline' in el) el.playsInline = true;
+}
+
+/** Caps GPU fill on phones without penalizing iPad `mobilePerf` as much. */
+function gamePixelRatioCap() {
+  if (!mobilePerf) return 1.5;
+  return isIPhoneOrIPod() ? 0.72 : 0.88;
+}
+
 let scene, camera, renderer;
 /** Set in init: skip shadow map + tune resolution. */
 let mobilePerf = false;
@@ -884,7 +900,7 @@ function initCoinAudioPool() {
     const a = new Audio(url);
     a.preload = 'auto';
     a.volume = 0.52;
-    if (mobilePerf) a.playsInline = true;
+    prepareAudioElementForIOS(a);
     coinAudioPool.push(a);
   }
 }
@@ -892,6 +908,7 @@ function initCoinAudioPool() {
 function playOneShotFromCache(key, volume, playbackRate = 1) {
   if (!bgmUnlocked || !sfxObjectUrls[key]) return;
   const a = new Audio(sfxObjectUrls[key]);
+  prepareAudioElementForIOS(a);
   a.volume = volume;
   a.playbackRate = playbackRate;
   a.play().catch(() => {});
@@ -3623,12 +3640,12 @@ function init() {
   renderer = new THREE.WebGLRenderer({
     canvas,
     antialias: false,
-    powerPreference: 'high-performance',
+    powerPreference: isIPhoneOrIPod() ? 'default' : 'high-performance',
     stencil: false,
     depth: true,
+    failIfMajorPerformanceCaveat: false,
   });
-  const dprCap = mobilePerf ? 0.88 : 1.5;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, gamePixelRatioCap()));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   if (mobilePerf) {
@@ -3695,6 +3712,14 @@ function init() {
   canvas.addEventListener('lostpointercapture', () => {
     activePointerId = null;
   });
+  canvas.addEventListener(
+    'webglcontextlost',
+    (e) => {
+      e.preventDefault();
+      console.warn('AstroRun: WebGL context lost');
+    },
+    false,
+  );
 
   overlay?.addEventListener('click', restart);
 
@@ -3727,8 +3752,7 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  const dprCap = mobilePerf ? 0.88 : 1.5;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, gamePixelRatioCap()));
 }
 
 /** Must match ground contact tolerance in `tick` (~`playerY <= 0.035`); too tight and jump never fires. */
@@ -4503,9 +4527,7 @@ async function preloadAudioPipeline() {
     a.preload = 'auto';
     a.loop = true;
     a.volume = BGM_VOLUME;
-    if (preferMobilePerf()) {
-      a.playsInline = true;
-    }
+    prepareAudioElementForIOS(a);
     await waitAudioElementReady(a);
     if (a.error) {
       revokeBgmBlobUrl();
@@ -4521,9 +4543,7 @@ async function preloadAudioPipeline() {
     r.loop = true;
     r.preload = 'auto';
     r.volume = 0.32;
-    if (preferMobilePerf()) {
-      r.playsInline = true;
-    }
+    prepareAudioElementForIOS(r);
     await waitAudioElementReady(r);
     if (!r.error) runAudio = r;
   }
@@ -4539,8 +4559,13 @@ async function preloadGraphicsPipeline() {
   if (!graphicsLoadPromise) {
     graphicsLoadPromise = (async () => {
       await Promise.all([loadAndApplyPlayerCharacter(), loadCoinPrefab()]);
-      if (typeof renderer.compile === 'function') {
-        renderer.compile(scene, camera);
+      // iPhone: synchronous compile of the whole scene often freezes or kills the tab (WebKit GPU limits).
+      if (typeof renderer.compile === 'function' && !isIPhoneOrIPod()) {
+        try {
+          renderer.compile(scene, camera);
+        } catch (err) {
+          console.warn('AstroRun: renderer.compile failed', err);
+        }
       }
       const warmFrames = mobilePerf ? 1 : 3;
       for (let i = 0; i < warmFrames; i += 1) {
