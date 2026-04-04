@@ -1110,7 +1110,7 @@ function updateRunSfx(dt) {
     return;
   }
   const onTunnelRoof =
-    getTunnelStripeAtZ(distance) &&
+    getTunnelStripeAtDistanceForFrame() &&
     (() => {
       const { roofTopY } = tunnelGeomConsts();
       return playerY >= roofTopY - 0.09 && playerY <= roofTopY + 0.26 && playerVy <= 0.08;
@@ -2025,6 +2025,8 @@ async function tryLoadExternalJumpClip(playerRoot) {
 
 /** Run → jump: short crossfade so the rig doesn’t pop or freeze at a hard stop/disable. */
 const PLAYER_RUN_TO_JUMP_CROSSFADE = 0.11;
+/** Mobile: dual-action crossfade doubles skinning cost — instant handoff (tiny pop vs big hitch). */
+const PLAYER_RUN_TO_JUMP_CROSSFADE_MOBILE = 0;
 
 function playPlayerJumpAnimation() {
   if (!playerMixer || !playerRunAction) return;
@@ -2044,7 +2046,7 @@ function playPlayerJumpAnimation() {
   playerJumpAnimOverride = true;
   removePlayerJumpFinishedListener();
 
-  const fadeSec = PLAYER_RUN_TO_JUMP_CROSSFADE;
+  const fadeSec = mobilePerf ? PLAYER_RUN_TO_JUMP_CROSSFADE_MOBILE : PLAYER_RUN_TO_JUMP_CROSSFADE;
   playerJumpAction.stopFading();
   playerRunAction.stopFading();
   playerJumpAction.enabled = true;
@@ -2059,7 +2061,11 @@ function playPlayerJumpAnimation() {
   playerJumpAction.setEffectiveWeight(1);
   playerJumpAction.play();
 
-  if (playerRunAction.isRunning() && playerRunAction.getEffectiveWeight() > 0.01) {
+  if (
+    playerRunAction.isRunning() &&
+    playerRunAction.getEffectiveWeight() > 0.01 &&
+    fadeSec > 1e-4
+  ) {
     playerRunAction.enabled = true;
     playerRunAction.paused = false;
     playerRunAction.crossFadeTo(playerJumpAction, fadeSec, false);
@@ -2594,13 +2600,35 @@ function getTunnelStripeAtZ(pz) {
   return res;
 }
 
+/** One tunnel lookup per render frame at `distance` (tick + audio + uniforms called it many times). */
+let _tunnelStripeFrameId = -1;
+let _tunnelStripeFrameGen = -1;
+let _tunnelStripeFrameDist = NaN;
+let _tunnelStripeFrameVal = null;
+
+function getTunnelStripeAtDistanceForFrame() {
+  const pz = distance;
+  if (
+    _tunnelStripeFrameId === renderFrameIndex &&
+    _tunnelStripeFrameGen === tunnelWorldLayoutGen &&
+    _tunnelStripeFrameDist === pz
+  ) {
+    return _tunnelStripeFrameVal;
+  }
+  _tunnelStripeFrameId = renderFrameIndex;
+  _tunnelStripeFrameGen = tunnelWorldLayoutGen;
+  _tunnelStripeFrameDist = pz;
+  _tunnelStripeFrameVal = getTunnelStripeAtZ(pz);
+  return _tunnelStripeFrameVal;
+}
+
 /**
  * Tunnel roof contact for gameplay (duck, jump). Looser `vyMax` for jump so brief
  * gravity ticks do not block jump; duck keeps a tight vy so we stay "standing".
  */
 function isPlayerOnTunnelRoof(opts = {}) {
   const vyMax = opts.vyMax ?? 0.12;
-  if (!getTunnelStripeAtZ(distance)) return false;
+  if (!getTunnelStripeAtDistanceForFrame()) return false;
   const { roofTopY } = tunnelGeomConsts();
   return (
     playerY >= roofTopY - 0.12 &&
@@ -2611,7 +2639,7 @@ function isPlayerOnTunnelRoof(opts = {}) {
 
 /** Jump on tunnel roof: looser vertical velocity than duck, so small gravity/snap ticks still allow a hop. */
 function canPlayerJumpFromTunnelRoof() {
-  if (!getTunnelStripeAtZ(distance)) return false;
+  if (!getTunnelStripeAtDistanceForFrame()) return false;
   const { roofTopY } = tunnelGeomConsts();
   return (
     playerY >= roofTopY - 0.16 &&
@@ -2866,12 +2894,14 @@ function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, 
 
 function syncTunnelNeonUniforms(dt) {
   if (!worldGroup || !playerGroup || !gameStarted) return;
-  const inside = getTunnelStripeAtZ(distance) != null;
+  const inside = getTunnelStripeAtDistanceForFrame() != null;
   const k = 1 - Math.exp(-dt * (inside ? 5.8 : 3.2));
   tunnelRunLightEase = THREE.MathUtils.lerp(tunnelRunLightEase, inside ? 1 : 0, k);
   if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
     runwaySlabMat.uniforms.uTunnelFloorBright.value = tunnelRunLightEase;
   }
+  /** Mobile: wall holo uniforms are many writes; slab brightness still updates above every frame. */
+  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
   const pz = playerGroup.position.z;
   for (let i = 0; i < worldGroup.children.length; i++) {
     const mats = worldGroup.children[i].userData?.tunnelNeonMats;
@@ -3643,7 +3673,7 @@ function updateBgmTunnelLowpassFilter(dt) {
     gameStarted &&
     alive &&
     runGameplayActive &&
-    getTunnelStripeAtZ(distance);
+    getTunnelStripeAtDistanceForFrame();
   const target = inTunnel ? 1 : 0;
   const k = 1 - Math.exp(-Math.min(0.1, dt) * BGM_TUNNEL_MUFFLE_SMOOTH);
   bgmTunnelMuffle += (target - bgmTunnelMuffle) * k;
@@ -3871,7 +3901,17 @@ function updateMusicReactiveVisuals(dt) {
   const pz = playerGroup ? playerGroup.position.z : 0;
   musicBackdropGroup.position.set(0, 0, pz);
   musicBackdropGroup.updateMatrixWorld(!mobilePerf);
-  /** Mobile: uniform/fog updates are heavy; backdrop still follows player every frame. */
+  /** Keep deck ring + scroll aligned with lane strafe every frame (cheap uniforms only). */
+  if (mobilePerf && runwaySlabMat?.uniforms && playerGroup) {
+    runwaySlabMat.uniforms.uScroll.value = distance;
+    runwaySlabMat.uniforms.uTime.value = musicPulseTime;
+    if (runwaySlabMat.uniforms.uPlayerX) runwaySlabMat.uniforms.uPlayerX.value = playerGroup.position.x;
+    if (runwaySlabMat.uniforms.uPlayerZ) runwaySlabMat.uniforms.uPlayerZ.value = playerGroup.position.z;
+    if (camera && runwaySlabMat.uniforms.uCamPos) {
+      runwaySlabMat.uniforms.uCamPos.value.copy(camera.position);
+    }
+  }
+  /** Mobile: sky/fog/BGM-eased slab pulse every other frame. */
   if (mobilePerf && (renderFrameIndex & 1) === 1) return;
 
   const raw = sampleBgmBands();
@@ -4534,7 +4574,7 @@ function tick(dt) {
   playerY += playerVy * dt;
 
   const pzTunnel = distance;
-  if (getTunnelStripeAtZ(pzTunnel)) {
+  if (getTunnelStripeAtDistanceForFrame()) {
     const { ceilBottomY, roofTopY } = tunnelGeomConsts();
     const topOff = THREE.MathUtils.lerp(PLAYER_STAND_TOP, PLAYER_DUCK_TOP, duckAmount);
     const bodyTop = playerY + topOff;
