@@ -303,10 +303,12 @@ function prepareAudioElementForIOS(el) {
   if (el && 'playsInline' in el) el.playsInline = true;
 }
 
-/** Caps GPU fill on phones without penalizing iPad `mobilePerf` as much. */
+/** Caps GPU fill on phones; iPhone used 0.48 before — far below native res and looked soft. */
 function gamePixelRatioCap() {
   if (!mobilePerf) return 1.5;
-  return isIPhoneOrIPod() ? 0.55 : 0.78;
+  const dpr = window.devicePixelRatio || 1;
+  if (isIPhoneOrIPod()) return Math.min(dpr, 0.95);
+  return Math.min(dpr, 1.2);
 }
 
 /** iOS/WebKit: HTMLAudio play() after `await` is not a user gesture — unlock in pointerdown/touchstart. */
@@ -344,6 +346,12 @@ let scene, camera, renderer;
 let mobilePerf = false;
 /** Frame counter for lobby + game loop (hologram uniform throttle). */
 let renderFrameIndex = 0;
+/** Mobile: accumulate dt for half-rate skeletal animation updates. */
+let playerMixerDtAccum = 0;
+/** Bumped when runway chunks are added (`spawnChunk`); invalidates tunnel Z cache. */
+let tunnelWorldLayoutGen = 0;
+const tunnelStripeAtZCache = new Map();
+let tunnelStripeCacheLayoutGen = -1;
 /** True after `init()` completes (WebGL + scene). Used to avoid double init on retry. */
 let graphicsInited = false;
 /** Reused so Play + background lobby never double-load the player GLB. */
@@ -642,15 +650,6 @@ let bgmIntroFadeDuration = 2.4;
 let difficultyRampT = 0;
 
 function makeRunwaySlabShaderMaterial() {
-  if (mobilePerf) {
-    const m = new THREE.MeshBasicMaterial({
-      color: 0x3a2258,
-      fog: true,
-    });
-    m.userData.mobileRunwayBasic = true;
-    return m;
-  }
-
   const runwayVertexShader = `
       varying vec3 vWPos;
       varying vec3 vWorldNormal;
@@ -680,6 +679,82 @@ function makeRunwaySlabShaderMaterial() {
     uFogColor: { value: new THREE.Color(0x281845) },
     uTunnelFloorBright: { value: 0 },
   };
+
+  const runwayFragmentMobile = `
+      varying vec3 vWPos;
+      varying vec3 vWorldNormal;
+      uniform float uScroll;
+      uniform float uTime;
+      uniform float uPulse;
+      uniform float uImpact;
+      uniform float uLaneW;
+      uniform vec3 uCyan;
+      uniform vec3 uMagenta;
+      uniform vec3 uVoid;
+      uniform vec3 uCamPos;
+      uniform float uFootFlash;
+      uniform float uPlayerX;
+      uniform float uPlayerZ;
+      uniform float uFogNear;
+      uniform float uFogFar;
+      uniform vec3 uFogColor;
+      uniform float uTunnelFloorBright;
+
+      void main() {
+        float tun = clamp(uTunnelFloorBright, 0.0, 1.0);
+        float ax = abs(vWPos.x);
+        float z = vWPos.z + uScroll;
+        float toL = abs(vWPos.x + uLaneW);
+        float toC = abs(vWPos.x);
+        float toR = abs(vWPos.x - uLaneW);
+        float w2 = uLaneW * uLaneW * 0.34;
+        float wL = exp(-toL * toL / w2);
+        float wC = exp(-toC * toC / w2);
+        float wR = exp(-toR * toR / w2);
+        float ws = wL + wC + wR + 1e-4;
+        wL /= ws;
+        wC /= ws;
+        wR /= ws;
+        vec3 lanePink = uMagenta * 1.12 + vec3(0.06, -0.02, 0.04);
+        vec3 laneNeon =
+          uCyan * (wL * 0.18 + wC * 0.18 + wR * 0.18) + lanePink * (wL * 0.92 + wC * 1.12 + wR * 0.92);
+        float beat = 0.34 + uPulse * 0.3;
+        float intf = sin(z * 0.28 + uTime * 1.6) * sin(ax * 1.8 - uTime * 1.2) * 0.5 + 0.5;
+        laneNeon *= 0.9 + intf * 0.18 * (1.0 + uPulse * 0.45);
+        vec3 base = uVoid.rgb * (1.14 + tun * 0.55) + vec3(0.042, 0.036, 0.072) * (1.0 + tun * 1.05);
+        vec3 underGlow = laneNeon * beat * 0.42;
+        vec3 N = normalize(vWorldNormal);
+        vec3 V = normalize(uCamPos - vWPos);
+        float ndv = clamp(dot(N, V), 0.0, 1.0);
+        float fresnel = pow(1.0 - ndv, 3.2) * 0.42;
+        vec3 haloAdd = mix(uCyan, uMagenta, 0.48) * fresnel * (0.38 + uPulse * 0.28);
+        float fLin = clamp(uFootFlash, 0.0, 1.0);
+        float pd = length(vec2(vWPos.x - uPlayerX, vWPos.z - uPlayerZ));
+        vec3 footAdd = mix(uCyan, uMagenta, sin(pd * 0.45 - uTime * 4.0) * 0.5 + 0.5) * fLin * exp(-pd * 0.42) * 0.48;
+        vec3 rgb =
+          base + underGlow + haloAdd + footAdd + (uCyan * 0.42 + uMagenta * 0.48) * uImpact * 0.1;
+        rgb += (vec3(1.0, 0.92, 0.5) * 0.35 + uMagenta * 0.32 + uCyan * 0.28) * tun * 0.12;
+        float camDist = length(vWPos - uCamPos);
+        float fogT = smoothstep(uFogNear, uFogFar, camDist);
+        fogT *= mix(1.0, 0.45, tun);
+        rgb = mix(rgb, uFogColor, fogT * 0.92);
+        gl_FragColor = vec4(rgb, 1.0);
+      }
+    `;
+
+  if (mobilePerf) {
+    return new THREE.ShaderMaterial({
+      uniforms: baseUniforms,
+      fog: false,
+      transparent: false,
+      depthWrite: true,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+      vertexShader: runwayVertexShader,
+      fragmentShader: runwayFragmentMobile,
+    });
+  }
 
   const mat = new THREE.ShaderMaterial({
     uniforms: {
@@ -1534,7 +1609,17 @@ function lobbyLoop(now) {
   ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
   if (playerGroup) playerGroup.position.z = LOBBY_RUNNER_ANCHOR_Z;
   applyLobbyCameraPose();
-  if (playerMixer) playerMixer.update(dt);
+  if (playerMixer) {
+    if (mobilePerf) {
+      playerMixerDtAccum += dt;
+      if ((renderFrameIndex & 1) === 0) {
+        playerMixer.update(playerMixerDtAccum);
+        playerMixerDtAccum = 0;
+      }
+    } else {
+      playerMixer.update(dt);
+    }
+  }
   if (lobbyBackdropDecorGroup) {
     lobbyBackdropDecorGroup.traverse((o) => {
       if (o.userData?.lobbySpinCoin) o.rotation.y += dt * 3.1;
@@ -1912,7 +1997,8 @@ function playPlayerJumpAnimation() {
  */
 function setupImageBasedLighting() {
   if (!renderer || !scene) return;
-  if (mobilePerf) {
+  /** iPhone: PMREM + full room env has caused WebKit compile/memory pain; use fill lights instead. */
+  if (mobilePerf && isIPhoneOrIPod()) {
     scene.environment = null;
     return;
   }
@@ -1928,12 +2014,8 @@ function enhancePlayerGltfMaterials(root) {
   root.traverse((o) => {
     if (!o.isMesh) return;
     const mats = Array.isArray(o.material) ? o.material : [o.material];
-    const out = [];
     for (const m of mats) {
-      if (!m) {
-        out.push(m);
-        continue;
-      }
+      if (!m) continue;
       if (m.map) {
         m.map.colorSpace = THREE.SRGBColorSpace;
         m.map.needsUpdate = true;
@@ -1942,29 +2024,8 @@ function enhancePlayerGltfMaterials(root) {
         m.emissiveMap.colorSpace = THREE.SRGBColorSpace;
         m.emissiveMap.needsUpdate = true;
       }
-      if (
-        mobilePerf &&
-        (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial || m.isMeshPhongMaterial || m.isMeshLambertMaterial)
-      ) {
-        const col = m.color?.clone?.() ?? new THREE.Color(0xffffff);
-        if (m.emissive && m.emissive.getHex() !== 0) {
-          col.lerp(m.emissive, Math.min(0.85, (m.emissiveIntensity ?? 0.35) * 0.9));
-        }
-        const nb = new THREE.MeshBasicMaterial({
-          map: m.map || null,
-          color: col,
-          transparent: m.transparent,
-          opacity: m.opacity,
-          side: m.side,
-          alphaMap: m.alphaMap || null,
-          fog: false,
-        });
-        m.dispose();
-        out.push(nb);
-        continue;
-      }
       if (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial) {
-        m.envMapIntensity = mobilePerf ? 0.22 : 1.35;
+        m.envMapIntensity = mobilePerf ? 0.72 : 1.35;
         m.fog = false;
         if (m.map) {
           if (m.metalness >= 0.95) m.metalness = 0.08;
@@ -1972,9 +2033,7 @@ function enhancePlayerGltfMaterials(root) {
         }
         m.needsUpdate = true;
       }
-      out.push(m);
     }
-    o.material = Array.isArray(o.material) ? out : out[0];
   });
 }
 
@@ -2349,20 +2408,16 @@ async function loadAndApplyPlayerCharacter() {
 
 function makeBlockPlayer() {
   const g = new THREE.Group();
-  const matBody = mobilePerf
-    ? new THREE.MeshBasicMaterial({ color: 0x4ecdc4, fog: true })
-    : new THREE.MeshPhongMaterial({
-        color: 0x4ecdc4,
-        shininess: 35,
-        specular: 0x224444,
-      });
-  const matAccent = mobilePerf
-    ? new THREE.MeshBasicMaterial({ color: 0xff6b6b, fog: true })
-    : new THREE.MeshPhongMaterial({
-        color: 0xff6b6b,
-        shininess: 25,
-        specular: 0x442222,
-      });
+  const matBody = new THREE.MeshPhongMaterial({
+    color: 0x4ecdc4,
+    shininess: 35,
+    specular: 0x224444,
+  });
+  const matAccent = new THREE.MeshPhongMaterial({
+    color: 0xff6b6b,
+    shininess: 25,
+    specular: 0x442222,
+  });
   const torso = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.65, 0.35), matBody);
   torso.position.y = 0.85;
   g.add(torso);
@@ -2407,28 +2462,43 @@ const TUNNEL_LENGTH_MIN = 22;
 const TUNNEL_LENGTH_RANGE = 26;
 
 /** Matches `makeTunnelStripe` mesh layout (used for roof / ceiling physics). */
+let _tunnelGeomConstsCached = null;
 function tunnelGeomConsts() {
-  const wallT = mobilePerf ? 0.11 : 0.15;
-  const wallH = mobilePerf ? 4.45 : 5.45;
-  const ceilT = mobilePerf ? 0.12 : 0.17;
-  const innerHalf = LANE_WIDTH * 1.8;
-  const yWall = wallH * 0.5 - 0.28;
-  const ceilCenterY = wallH - 0.15 + ceilT * 0.5;
-  const ceilBottomY = ceilCenterY - ceilT * 0.5;
-  const roofTopY = ceilCenterY + ceilT * 0.5;
-  return { wallT, wallH, ceilT, innerHalf, yWall, ceilCenterY, ceilBottomY, roofTopY };
+  if (!_tunnelGeomConstsCached) {
+    const wallT = mobilePerf ? 0.11 : 0.15;
+    const wallH = mobilePerf ? 4.45 : 5.45;
+    const ceilT = mobilePerf ? 0.12 : 0.17;
+    const innerHalf = LANE_WIDTH * 1.8;
+    const yWall = wallH * 0.5 - 0.28;
+    const ceilCenterY = wallH - 0.15 + ceilT * 0.5;
+    const ceilBottomY = ceilCenterY - ceilT * 0.5;
+    const roofTopY = ceilCenterY + ceilT * 0.5;
+    _tunnelGeomConstsCached = { wallT, wallH, ceilT, innerHalf, yWall, ceilCenterY, ceilBottomY, roofTopY };
+  }
+  return _tunnelGeomConstsCached;
 }
 
 function getTunnelStripeAtZ(pz) {
   if (!worldGroup) return null;
+  if (tunnelStripeCacheLayoutGen !== tunnelWorldLayoutGen) {
+    tunnelStripeAtZCache.clear();
+    tunnelStripeCacheLayoutGen = tunnelWorldLayoutGen;
+  }
+  const k = Math.floor(pz * 32) / 32;
+  if (tunnelStripeAtZCache.has(k)) return tunnelStripeAtZCache.get(k);
+  let res = null;
   for (let i = 0; i < worldGroup.children.length; i++) {
     const ch = worldGroup.children[i];
     if (!ch.userData?.isTunnel) continue;
     const z0 = ch.userData.zStart;
     const z1 = ch.userData.zEnd;
-    if (pz >= z0 && pz <= z1) return ch;
+    if (pz >= z0 && pz <= z1) {
+      res = ch;
+      break;
+    }
   }
-  return null;
+  tunnelStripeAtZCache.set(k, res);
+  return res;
 }
 
 /**
@@ -2505,9 +2575,9 @@ function makeTunnelStripe(z0, length) {
   const edgeR = new THREE.Color().setHSL(hY - 0.01, 0.92, 0.57);
   const coreC = new THREE.Color().setHSL(hY + 0.012, 0.84, 0.1);
   const edgeC = new THREE.Color().setHSL(hY + 0.024, 0.91, 0.55);
-  const matL = makeTunnelNeonMaterial(coreL, edgeL, mobilePerf ? 0.22 : 0.26, 0.86, rng() * Math.PI * 2);
-  const matR = makeTunnelNeonMaterial(coreR, edgeR, mobilePerf ? 0.22 : 0.26, 0.84, rng() * Math.PI * 2);
-  const matC = makeTunnelNeonMaterial(coreC, edgeC, mobilePerf ? 0.2 : 0.24, 0.88, rng() * Math.PI * 2);
+  const matL = makeTunnelNeonMaterial(coreL, edgeL, mobilePerf ? 0.25 : 0.26, 0.86, rng() * Math.PI * 2);
+  const matR = makeTunnelNeonMaterial(coreR, edgeR, mobilePerf ? 0.25 : 0.26, 0.84, rng() * Math.PI * 2);
+  const matC = makeTunnelNeonMaterial(coreC, edgeC, mobilePerf ? 0.23 : 0.24, 0.88, rng() * Math.PI * 2);
 
   const left = new THREE.Mesh(new THREE.BoxGeometry(d.wallT, d.wallH, length), matL);
   left.position.set(-(d.innerHalf + d.wallT * 0.5), d.yWall, zc);
@@ -2530,20 +2600,10 @@ function makeTunnelStripe(z0, length) {
 
   slab.receiveShadow = !mobilePerf;
 
-  return g;
-}
+  /** Avoid `worldGroup.traverse` every frame in `syncTunnelNeonUniforms` (Three.js perf: minimize traversals). */
+  g.userData.tunnelNeonMats = [matL, matR, matC];
 
-/** Mobile: unlit only — no hologram shaders, no additive “bloom” stacks. */
-function makeMobileFlatHoloMaterial(coreColor, edgeColor, opacity) {
-  const c = coreColor.clone().lerp(edgeColor, 0.5);
-  return new THREE.MeshBasicMaterial({
-    color: c,
-    transparent: true,
-    opacity: THREE.MathUtils.clamp(opacity, 0.22, 0.88),
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    fog: true,
-  });
+  return g;
 }
 
 const HOLO_BOX_VS = `
@@ -2690,11 +2750,6 @@ const TUNNEL_NEON_FS = `
 `;
 
 function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, phase = 0) {
-  if (mobilePerf) {
-    const mat = makeMobileFlatHoloMaterial(coreColor, edgeColor, alpha + 0.22);
-    mat.userData.tunnelNeon = true;
-    return mat;
-  }
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2721,27 +2776,22 @@ function syncTunnelNeonUniforms(dt) {
   const inside = getTunnelStripeAtZ(distance) != null;
   const k = 1 - Math.exp(-dt * (inside ? 5.8 : 3.2));
   tunnelRunLightEase = THREE.MathUtils.lerp(tunnelRunLightEase, inside ? 1 : 0, k);
-  if (mobilePerf) return;
   if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
     runwaySlabMat.uniforms.uTunnelFloorBright.value = tunnelRunLightEase;
   }
   const pz = playerGroup.position.z;
-  worldGroup.traverse((obj) => {
-    if (!obj.isMesh) return;
-    const mat = obj.material;
-    const list = Array.isArray(mat) ? mat : [mat];
-    for (const m of list) {
-      if (!m?.uniforms?.uPlayerZ || !m.userData?.tunnelNeon) continue;
+  for (let i = 0; i < worldGroup.children.length; i++) {
+    const mats = worldGroup.children[i].userData?.tunnelNeonMats;
+    if (!mats) continue;
+    for (let j = 0; j < mats.length; j++) {
+      const m = mats[j];
       m.uniforms.uPlayerZ.value = pz;
       m.uniforms.uRunLightEase.value = tunnelRunLightEase;
     }
-  });
+  }
 }
 
 function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, phase = 0) {
-  if (mobilePerf) {
-    return makeMobileFlatHoloMaterial(coreColor, edgeColor, alpha * 0.9 + 0.14);
-  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2817,19 +2867,6 @@ const BOOST_FS = `
 `;
 
 function makeBoostHologramMaterial(isDecoy = false) {
-  if (mobilePerf) {
-    const mat = new THREE.MeshBasicMaterial({
-      color: isDecoy ? 0x3a5562 : 0x44eeff,
-      transparent: true,
-      opacity: isDecoy ? 0.4 : 0.64,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      fog: true,
-    });
-    mat.userData.mobileBoostPad = true;
-    mat.userData.mobileDecoyBoost = isDecoy;
-    return mat;
-  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2876,18 +2913,6 @@ const POWER_FS = `
 `;
 
 function makePowerPadMaterial() {
-  if (mobilePerf) {
-    const mat = new THREE.MeshBasicMaterial({
-      color: 0xff6ba8,
-      transparent: true,
-      opacity: 0.7,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      fog: true,
-    });
-    mat.userData.mobilePowerPad = true;
-    return mat;
-  }
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
@@ -2939,31 +2964,13 @@ function makeCurvedJumpPadGeometry(w, d, sx = 10, sz = 16) {
 function setPadUsedUniform(root, used) {
   root.traverse((obj) => {
     const m = obj.material;
-    if (!m) return;
-    if (m.uniforms?.uUsed != null) {
-      m.uniforms.uUsed.value = used;
-      return;
-    }
-    if (m.userData?.mobileBoostPad) {
-      if (m.userData.mobileDecoyBoost) {
-        m.color.set(used ? 0x2a3840 : 0x3a5562);
-        m.opacity = used ? 0.22 : 0.4;
-      } else {
-        m.color.set(used ? 0x1a3540 : 0x44eeff);
-        m.opacity = used ? 0.24 : 0.64;
-      }
-      return;
-    }
-    if (m.userData?.mobilePowerPad) {
-      m.color.set(used ? 0x5a2048 : 0xff6ba8);
-      m.opacity = used ? 0.32 : 0.7;
-    }
+    if (m?.uniforms?.uUsed != null) m.uniforms.uUsed.value = used;
   });
 }
 
 function syncHologramTimeUniforms(t) {
   if (!scene) return;
-  if (mobilePerf) return;
+  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
   scene.traverse((obj) => {
     const m = obj.material;
     if (!m) return;
@@ -3010,10 +3017,12 @@ function spawnChunk(endZ) {
   if (rng() < tunnelP) {
     const tLen = TUNNEL_LENGTH_MIN + rng() * TUNNEL_LENGTH_RANGE;
     worldGroup.add(makeTunnelStripe(z0, tLen));
+    tunnelWorldLayoutGen += 1;
     return z0 + tLen;
   }
   const len = 24 + rng() * 16;
   worldGroup.add(makeGroundStripe(z0, len));
+  tunnelWorldLayoutGen += 1;
   return z0 + len;
 }
 
@@ -3523,28 +3532,10 @@ function createMusicBackdrop() {
   musicBackdropGroup = new THREE.Group();
   musicBackdropGroup.name = 'musicBackdrop';
 
-  if (mobilePerf) {
-    const skyGeoM = new THREE.SphereGeometry(120, 6, 4);
-    musicSkyMaterial = new THREE.MeshBasicMaterial({
-      color: 0x1a0a2a,
-      side: THREE.BackSide,
-      depthWrite: false,
-      fog: true,
-    });
-    musicSkyMaterial.userData.mobileBackdropSky = true;
-    const skyMeshM = new THREE.Mesh(skyGeoM, musicSkyMaterial);
-    skyMeshM.renderOrder = -500;
-    musicBackdropGroup.add(skyMeshM);
-    musicGridFloorMaterial = null;
-    musicGridCeilingMaterial = null;
-    musicStarsMaterial = null;
-    scene.add(musicBackdropGroup);
-    return;
-  }
-
-  const skySegs = 20;
-  const skyRings = 14;
-  const skyGeo = new THREE.SphereGeometry(145, skySegs, skyRings);
+  const skySegs = mobilePerf ? 14 : 20;
+  const skyRings = mobilePerf ? 9 : 14;
+  const skyR = mobilePerf ? 138 : 145;
+  const skyGeo = new THREE.SphereGeometry(skyR, skySegs, skyRings);
   musicSkyMaterial = new THREE.ShaderMaterial({
     uniforms: {
       uMagenta: { value: new THREE.Color(0xff0a78) },
@@ -3615,8 +3606,8 @@ function createMusicBackdrop() {
   skyMesh.renderOrder = -500;
   musicBackdropGroup.add(skyMesh);
 
-  const gridW = 290;
-  const gridD = 440;
+  const gridW = mobilePerf ? 210 : 290;
+  const gridD = mobilePerf ? 340 : 440;
   const floorGeo = new THREE.PlaneGeometry(gridW, gridD, 1, 1);
   musicGridFloorMaterial = makeNeonGridShaderMaterial(false);
   const floor = new THREE.Mesh(floorGeo, musicGridFloorMaterial);
@@ -3632,7 +3623,7 @@ function createMusicBackdrop() {
   ceil.renderOrder = -480;
   musicBackdropGroup.add(ceil);
 
-  const starN = 198;
+  const starN = mobilePerf ? 110 : 198;
   const starPos = new Float32Array(starN * 3);
   for (let i = 0; i < starN; i++) {
     starPos[i * 3] = (Math.random() - 0.5) * 168;
@@ -3643,9 +3634,9 @@ function createMusicBackdrop() {
   starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
   musicStarsMaterial = new THREE.PointsMaterial({
     color: 0xffb8fc,
-    size: 0.22,
+    size: mobilePerf ? 0.21 : 0.22,
     transparent: true,
-    opacity: 0.92,
+    opacity: mobilePerf ? 0.82 : 0.92,
     sizeAttenuation: true,
     depthWrite: false,
     fog: false,
@@ -3665,6 +3656,8 @@ function updateMusicReactiveVisuals(dt) {
   const pz = playerGroup ? playerGroup.position.z : 0;
   musicBackdropGroup.position.set(0, 0, pz);
   musicBackdropGroup.updateMatrixWorld(!mobilePerf);
+  /** Mobile: uniform/fog updates are heavy; backdrop still follows player every frame. */
+  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
 
   const raw = sampleBgmBands();
   const bandK = 1 - Math.exp(-dt * 2.6);
@@ -3678,47 +3671,34 @@ function updateMusicReactiveVisuals(dt) {
   const aliveBoost = alive ? 1 : gameStarted ? 0.4 : 0.84;
   const colorK = 1 - Math.exp(-dt * 2.4);
 
-  if (musicSkyMaterial) {
-    if (musicSkyMaterial.uniforms) {
-      const tgtPulse = bass * aliveBoost;
-      musicSkyMaterial.uniforms.uPulse.value = THREE.MathUtils.lerp(
-        musicSkyMaterial.uniforms.uPulse.value,
-        tgtPulse,
-        0.07,
-      );
-      musicSkyMaterial.uniforms.uShimmer.value = musicPulseTime * (1.22 + mid * 2.35 + bass * 0.58);
-      musicSkyMaterial.uniforms.uMid.value = mid * aliveBoost;
-      musicSkyMaterial.uniforms.uHigh.value = high * aliveBoost;
-      musicSkyMaterial.uniforms.uFlow.value = musicPulseTime;
+  if (musicSkyMaterial?.uniforms) {
+    const tgtPulse = bass * aliveBoost;
+    musicSkyMaterial.uniforms.uPulse.value = THREE.MathUtils.lerp(
+      musicSkyMaterial.uniforms.uPulse.value,
+      tgtPulse,
+      0.07,
+    );
+    musicSkyMaterial.uniforms.uShimmer.value = musicPulseTime * (1.22 + mid * 2.35 + bass * 0.58);
+    musicSkyMaterial.uniforms.uMid.value = mid * aliveBoost;
+    musicSkyMaterial.uniforms.uHigh.value = high * aliveBoost;
+    musicSkyMaterial.uniforms.uFlow.value = musicPulseTime;
 
-      tmpMusicColor.setHSL(
-        (0.91 + bass * 0.018 + mid * 0.012) % 1,
-        1,
-        0.46 + high * 0.05,
-      );
-      musicSkyMaterial.uniforms.uMagenta.value.lerp(tmpMusicColor, colorK);
-      tmpMusicColor.setHSL((0.5 + mid * 0.04) % 1, 0.95, 0.48 + bass * 0.055);
-      musicSkyMaterial.uniforms.uCyan.value.lerp(tmpMusicColor, colorK);
-      tmpMusicColor.setRGB(0.02 + bass * 0.012, 0.008 + mid * 0.014, 0.048 + mid * 0.02);
-      musicSkyMaterial.uniforms.uVoid.value.lerp(tmpMusicColor, colorK);
-    } else if (musicSkyMaterial.userData.mobileBackdropSky) {
-      tmpMusicColor.setHSL(
-        (0.86 + bass * 0.06 + mid * 0.04) % 1,
-        0.42 + mid * 0.28,
-        0.1 + high * 0.08 + bass * 0.06,
-      );
-      musicSkyMaterial.color.lerp(tmpMusicColor, colorK);
-    }
+    tmpMusicColor.setHSL(
+      (0.91 + bass * 0.018 + mid * 0.012) % 1,
+      1,
+      0.46 + high * 0.05,
+    );
+    musicSkyMaterial.uniforms.uMagenta.value.lerp(tmpMusicColor, colorK);
+    tmpMusicColor.setHSL((0.5 + mid * 0.04) % 1, 0.95, 0.48 + bass * 0.055);
+    musicSkyMaterial.uniforms.uCyan.value.lerp(tmpMusicColor, colorK);
+    tmpMusicColor.setRGB(0.02 + bass * 0.012, 0.008 + mid * 0.014, 0.048 + mid * 0.02);
+    musicSkyMaterial.uniforms.uVoid.value.lerp(tmpMusicColor, colorK);
   }
 
   if (runwaySlabMat?.uniforms?.uCyan && musicSkyMaterial?.uniforms) {
     runwaySlabMat.uniforms.uCyan.value.copy(musicSkyMaterial.uniforms.uCyan.value);
     runwaySlabMat.uniforms.uMagenta.value.copy(musicSkyMaterial.uniforms.uMagenta.value);
     runwaySlabMat.uniforms.uVoid.value.copy(musicSkyMaterial.uniforms.uVoid.value);
-  }
-  if (runwaySlabMat?.userData?.mobileRunwayBasic && musicSkyMaterial?.userData?.mobileBackdropSky) {
-    tmpMusicColor.copy(musicSkyMaterial.color).multiplyScalar(0.58);
-    runwaySlabMat.color.lerp(tmpMusicColor, colorK);
   }
   if (runwaySlabMat?.uniforms?.uFogNear && scene?.fog?.isFog) {
     const f = scene.fog;
@@ -3811,7 +3791,7 @@ function init() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0c0822);
   if (mobilePerf) {
-    scene.fog = new THREE.Fog(0x281845, 24, 78);
+    scene.fog = new THREE.Fog(0x281845, 28, 96);
   } else {
     scene.fog = new THREE.Fog(0x281845, 32, 108);
   }
@@ -3835,8 +3815,8 @@ function init() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   if (mobilePerf) {
-    renderer.toneMapping = THREE.LinearToneMapping;
-    renderer.toneMappingExposure = 1.05;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.06;
   } else {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.18;
@@ -3846,10 +3826,10 @@ function init() {
 
   setupImageBasedLighting();
 
-  const hemi = new THREE.HemisphereLight(0xfff0ff, 0x2a2248, 1.02);
+  const hemi = new THREE.HemisphereLight(0xfff0ff, 0x2a2248, mobilePerf ? 1.14 : 1.02);
   hemiLightRef = hemi;
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffffff, 1.24);
+  const sun = new THREE.DirectionalLight(0xffffff, mobilePerf ? 1.42 : 1.24);
   sun.position.set(8, 18, 10);
   sun.castShadow = !mobilePerf;
   dirLightRef = sun;
@@ -3863,6 +3843,14 @@ function init() {
     sun.shadow.camera.bottom = -5;
   }
   scene.add(sun);
+  if (mobilePerf) {
+    const fill = new THREE.DirectionalLight(0xdde8ff, 0.48);
+    fill.position.set(-16, 11, 6);
+    scene.add(fill);
+    const rim = new THREE.DirectionalLight(0xffe0f5, 0.32);
+    rim.position.set(4, 7, -20);
+    scene.add(rim);
+  }
 
   createMusicBackdrop();
 
@@ -4141,6 +4129,7 @@ function restart() {
   powerSpeedRemain = 0;
 
   while (worldGroup.children.length) worldGroup.remove(worldGroup.children[0]);
+  tunnelWorldLayoutGen += 1;
   let zEnd = 0;
   const restartChunks = mobilePerf ? 3 : 6;
   for (let i = 0; i < restartChunks; i++) zEnd = spawnChunk(zEnd);
@@ -4490,7 +4479,7 @@ function tick(dt) {
   const lookY = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
   camera.lookAt(playerGroup.position.x * 0.4, lookY, pz + 10);
 
-  const spawnLookahead = mobilePerf ? 54 : 78;
+  const spawnLookahead = mobilePerf ? 40 : 78;
   while (nextSpawnZ < pz + spawnLookahead) {
     const roll = rng();
     if (roll < 0.38) {
@@ -4520,7 +4509,8 @@ function tick(dt) {
   }
 
   const oldest = worldGroup.children[0];
-  if (oldest?.userData.zEnd != null && pz > oldest.userData.zEnd + 22) {
+  const chunkDropBehind = mobilePerf ? 14 : 22;
+  if (oldest?.userData.zEnd != null && pz > oldest.userData.zEnd + chunkDropBehind) {
     worldGroup.remove(oldest);
     const last = worldGroup.children[worldGroup.children.length - 1];
     const lastEnd = last?.userData.zEnd ?? pz + 40;
@@ -4569,10 +4559,35 @@ function tick(dt) {
     setPadUsedUniform(pad.mesh, 1);
   }
 
+  const roofTopYMega = tunnelGeomConsts().roofTopY;
+  const spinIdleCoin = (c) => {
+    c.mesh.rotation.y += dt * 4.8;
+    if (c.mesh.userData?.isCoinGltf) {
+      c.mesh.rotation.x += dt * 0.85 * Math.sin(distance * 0.08 + c.z * 0.2);
+      c.mesh.rotation.z += dt * 0.45 * Math.cos(distance * 0.06 + c.z * 0.15);
+    }
+  };
   for (const c of coins) {
+    if (c.collecting) {
+      c.collectTime += dt;
+      c.mesh.rotation.y += dt * (26 + c.collectTime * 48);
+      c.mesh.rotation.x += dt * 16;
+      c.mesh.rotation.z += dt * 9;
+      const u = Math.min(1, c.collectTime / 0.38);
+      c.mesh.scale.setScalar(c.baseScale * (1 + u * u * 2.4));
+      if (c.collectTime >= 0.48) c.pendingDispose = true;
+      continue;
+    }
     if (c.collected) continue;
-    if (Math.abs(c.mesh.position.z - pz) > 0.55) continue;
-    if (Math.abs(c.mesh.position.x - playerGroup.position.x) > 0.65) continue;
+    if (Math.abs(c.mesh.position.z - pz) > 0.55) {
+      /** Matches old loop order: cull removes far coins before idle spin. */
+      if (c.mesh.position.z >= pz - 25) spinIdleCoin(c);
+      continue;
+    }
+    if (Math.abs(c.mesh.position.x - playerGroup.position.x) > 0.65) {
+      spinIdleCoin(c);
+      continue;
+    }
     if (c.jumpPurple) {
       const foot = playerY;
       const top =
@@ -4580,10 +4595,15 @@ function tick(dt) {
         THREE.MathUtils.lerp(PLAYER_STAND_TOP, PLAYER_DUCK_TOP, duckAmount);
       const cy = c.mesh.position.y;
       const r = PURPLE_JUMP_COIN_HIT_R;
-      if (top < cy - r || foot > cy + r) continue;
+      if (top < cy - r || foot > cy + r) {
+        spinIdleCoin(c);
+        continue;
+      }
     } else if (c.mega) {
-      const { roofTopY } = tunnelGeomConsts();
-      if (playerY < roofTopY - 0.2) continue;
+      if (playerY < roofTopYMega - 0.2) {
+        spinIdleCoin(c);
+        continue;
+      }
     }
     c.collected = true;
     c.collecting = true;
@@ -4644,24 +4664,6 @@ function tick(dt) {
     }
   }
 
-  for (const c of coins) {
-    if (c.collecting) {
-      c.collectTime += dt;
-      c.mesh.rotation.y += dt * (26 + c.collectTime * 48);
-      c.mesh.rotation.x += dt * 16;
-      c.mesh.rotation.z += dt * 9;
-      const u = Math.min(1, c.collectTime / 0.38);
-      c.mesh.scale.setScalar(c.baseScale * (1 + u * u * 2.4));
-      if (c.collectTime >= 0.48) c.pendingDispose = true;
-    } else if (!c.collected) {
-      c.mesh.rotation.y += dt * 4.8;
-      if (c.mesh.userData?.isCoinGltf) {
-        c.mesh.rotation.x += dt * 0.85 * Math.sin(distance * 0.08 + c.z * 0.2);
-        c.mesh.rotation.z += dt * 0.45 * Math.cos(distance * 0.06 + c.z * 0.15);
-      }
-    }
-  }
-
   syncTunnelNeonUniforms(dt);
 }
 
@@ -4691,7 +4693,17 @@ function loop(now) {
     updateIntroCamera();
   }
   if (playerRunAction && gameStarted && !alive) playerRunAction.timeScale = 0;
-  if (playerMixer) playerMixer.update(dt);
+  if (playerMixer) {
+    if (mobilePerf) {
+      playerMixerDtAccum += dt;
+      if ((renderFrameIndex & 1) === 0) {
+        playerMixer.update(playerMixerDtAccum);
+        playerMixerDtAccum = 0;
+      }
+    } else {
+      playerMixer.update(dt);
+    }
+  }
   updateBgmPlayback(dt);
   updateRunSfx(dt);
   updateMusicReactiveVisuals(dt);

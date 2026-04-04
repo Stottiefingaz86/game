@@ -808,3 +808,82 @@ body.mobile-touch-ui.game-running .mobile-controls {
   border: 2px solid rgba(200, 200, 220, 0.2);
   color: rgba(255, 255, 255, 0.92);
 }
+
+/* —— Phones / touch-primary: larger HUD, safe areas, frosted control dock —— */
+body.mobile-touch-ui #hud {
+  top: max(0.5rem, env(safe-area-inset-top, 0px));
+  left: 50%;
+  right: auto;
+  transform: translateX(-50%);
+  max-width: calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 1rem);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+body.mobile-touch-ui .hud-stack {
+  gap: 0.45rem 0.55rem;
+}
+
+body.mobile-touch-ui .hud-pill {
+  min-width: 5.85rem;
+  padding: 0.42rem 0.95rem 0.48rem;
+  border-radius: 1.05rem;
+  border-width: 2px;
+  box-shadow:
+    0 6px 0 rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+body.mobile-touch-ui .hud-label {
+  font-size: clamp(0.68rem, 2.6vw, 0.8rem);
+  letter-spacing: 0.12em;
+}
+
+body.mobile-touch-ui .hud-num {
+  font-size: clamp(1.55rem, 5.2vw, 2.05rem);
+}
+
+body.mobile-touch-ui .hud-pill-score .hud-num {
+  font-size: clamp(1.65rem, 5.8vw, 2.2rem);
+}
+
+body.mobile-touch-ui .hud-hint {
+  font-size: 0.66rem;
+}
+
+body.mobile-touch-ui .hud-speed {
+  font-size: clamp(0.92rem, 2.8vw, 1.12rem);
+  margin-top: 0.15rem;
+}
+
+body.mobile-touch-ui.game-running .mobile-controls {
+  padding-top: 0.5rem;
+  padding-bottom: max(0.65rem, env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(180deg, transparent 0%, rgba(4, 6, 12, 0.55) 35%, rgba(4, 6, 12, 0.82) 100%);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+}
+
+body.mobile-touch-ui .mobile-ctrl-stack {
+  max-width: min(12.5rem, 42vw);
+  gap: 0.42rem;
+}
+
+body.mobile-touch-ui .mobile-ctrl--lane {
+  flex: 0 0 min(5rem, 24vw);
+  min-height: 6.1rem;
+  border-radius: 1.15rem;
+  font-size: clamp(1.45rem, 6.5vw, 1.95rem);
+}
+
+body.mobile-touch-ui .mobile-ctrl--jump {
+  min-height: 3.45rem;
+  font-size: clamp(1rem, 4vw, 1.22rem);
+  border-radius: 1.1rem;
+}
+
+body.mobile-touch-ui .mobile-ctrl--back {
+  min-height: 2.55rem;
+  font-size: clamp(0.78rem, 3.4vw, 0.92rem);
+  border-radius: 0.95rem;
+}
