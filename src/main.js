@@ -500,9 +500,9 @@ let rng = mulberry32(0x9e3779b9);
 /**
  * When true, phones/tablets skip HTML background music entirely (no fetch/decode) so you can test
  * whether BGM was causing freezes or cutouts. Sky/grid still animate via procedural `sampleBgmBands`.
- * Set to `false` to restore mobile BGM.
+ * Set to `true` to skip BGM fetch/decode on phones (saves CPU + memory).
  */
-const DISABLE_BGM_ON_MOBILE = true;
+const DISABLE_BGM_ON_MOBILE = false;
 
 /**
  * Background music: `public/sounds/` first (same folder as SFX), then `public/bgsound/`.
@@ -913,6 +913,11 @@ let sfxObjectUrls = {};
 /** Rotate through clips so rapid coin pickups do not cancel each other. */
 let coinAudioPool = [];
 let coinPoolIdx = 0;
+/** Pooled jump/land — avoids `new Audio()` per event (main thread + decode spikes on mobile). */
+let jumpAudioPool = [];
+let jumpPoolIdx = 0;
+let landAudioPool = [];
+let landPoolIdx = 0;
 /** Throttle expensive per-frame mesh updates. */
 let tickFrame = 0;
 /** Each coin raises playbackRate (higher pitch); capped so it stays usable. */
@@ -1012,6 +1017,36 @@ function initCoinAudioPool() {
   }
 }
 
+function initJumpLandAudioPools() {
+  const n = mobilePerf ? 2 : 4;
+  if (jumpAudioPool.length === 0) {
+    jumpPoolIdx = 0;
+    const ju = sfxObjectUrls.jump;
+    if (ju) {
+      for (let i = 0; i < n; i += 1) {
+        const a = new Audio(ju);
+        a.preload = 'auto';
+        a.volume = 0.55;
+        prepareAudioElementForIOS(a);
+        jumpAudioPool.push(a);
+      }
+    }
+  }
+  if (landAudioPool.length === 0) {
+    landPoolIdx = 0;
+    const lu = sfxObjectUrls.land;
+    if (lu) {
+      for (let i = 0; i < n; i += 1) {
+        const a = new Audio(lu);
+        a.preload = 'auto';
+        a.volume = 0.48;
+        prepareAudioElementForIOS(a);
+        landAudioPool.push(a);
+      }
+    }
+  }
+}
+
 function playOneShotFromCache(key, volume, playbackRate = 1) {
   if (!bgmUnlocked || !sfxObjectUrls[key]) return;
   const a = new Audio(sfxObjectUrls[key]);
@@ -1022,17 +1057,40 @@ function playOneShotFromCache(key, volume, playbackRate = 1) {
 }
 
 function playJumpSfx() {
-  playOneShotFromCache('jump', 0.55);
+  if (!bgmUnlocked) return;
+  if (jumpAudioPool.length > 0) {
+    const a = jumpAudioPool[jumpPoolIdx % jumpAudioPool.length];
+    jumpPoolIdx += 1;
+    a.pause();
+    a.currentTime = 0;
+    a.playbackRate = 1;
+    a.play().catch(() => {});
+  } else {
+    playOneShotFromCache('jump', 0.55);
+  }
 }
 
 function playLandSfx() {
-  playOneShotFromCache('land', 0.48);
+  if (!bgmUnlocked) return;
+  if (landAudioPool.length > 0) {
+    const a = landAudioPool[landPoolIdx % landAudioPool.length];
+    landPoolIdx += 1;
+    a.pause();
+    a.currentTime = 0;
+    a.playbackRate = 1;
+    a.play().catch(() => {});
+  } else {
+    playOneShotFromCache('land', 0.48);
+  }
 }
 
 function playCoinSfx(totalCoins) {
   if (!bgmUnlocked || coinAudioPool.length === 0) return;
   const n = Math.max(1, totalCoins);
-  const rate = Math.min(COIN_PITCH_MAX_RATE, 1 + (n - 1) * COIN_PITCH_STEP);
+  /** Mobile: fixed rate avoids extra `playbackRate` graph churn; pitch ramp is subtle there. */
+  const rate = mobilePerf
+    ? 1
+    : Math.min(COIN_PITCH_MAX_RATE, 1 + (n - 1) * COIN_PITCH_STEP);
   const a = coinAudioPool[coinPoolIdx % coinAudioPool.length];
   coinPoolIdx += 1;
   a.pause();
@@ -4818,6 +4876,8 @@ function tick(dt) {
       c.mesh.rotation.z += dt * 0.45 * Math.cos(distance * 0.06 + c.z * 0.15);
     }
   };
+  /** One coin sound per frame max (rows used to stack many `play()` calls in one tick). */
+  let coinSfxCountAfterPickups = -1;
   for (const c of coins) {
     if (c.collecting) {
       c.collectTime += dt;
@@ -4864,13 +4924,22 @@ function tick(dt) {
     coinCount += add;
     if (hudCoinsEl) hudCoinsEl.textContent = String(coinCount);
     if (hudCoinsWrap) {
-      hudCoinsWrap.classList.remove('hud-pop');
-      void hudCoinsWrap.offsetWidth;
-      hudCoinsWrap.classList.add('hud-pop');
-      window.clearTimeout(hudCoinsWrap._coinPopT);
-      hudCoinsWrap._coinPopT = window.setTimeout(() => hudCoinsWrap.classList.remove('hud-pop'), 420);
+      if (mobilePerf) {
+        window.clearTimeout(hudCoinsWrap._coinPopT);
+        hudCoinsWrap.classList.add('hud-pop');
+        hudCoinsWrap._coinPopT = window.setTimeout(() => hudCoinsWrap.classList.remove('hud-pop'), 380);
+      } else {
+        hudCoinsWrap.classList.remove('hud-pop');
+        void hudCoinsWrap.offsetWidth;
+        hudCoinsWrap.classList.add('hud-pop');
+        window.clearTimeout(hudCoinsWrap._coinPopT);
+        hudCoinsWrap._coinPopT = window.setTimeout(() => hudCoinsWrap.classList.remove('hud-pop'), 420);
+      }
     }
-    playCoinSfx(coinCount);
+    coinSfxCountAfterPickups = coinCount;
+  }
+  if (coinSfxCountAfterPickups >= 0) {
+    playCoinSfx(coinSfxCountAfterPickups);
   }
 
   const metersInt = Math.floor(distance);
@@ -5065,6 +5134,7 @@ function wireStartScreen() {
       await bootstrapLobbyGraphics();
       if (gameStarted) return;
       initCoinAudioPool();
+      initJumpLandAudioPools();
       gameStarted = true;
       unlockBgm();
       if (startStatusEl) startStatusEl.textContent = '';
