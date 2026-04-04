@@ -366,6 +366,12 @@ let lobbyGraphicsReady = false;
 let bootstrapAssetsPromise = null;
 /** True after `waitAudioElementReady` succeeds for BGM (avoids starting run on empty buffer). */
 let bgmLoadReady = false;
+/**
+ * Mobile: seconds to wait before starting run-loop SFX so BGM is not fighting a second decoder with WebGL.
+ */
+let mobileRunSfxDelayRemain = 0;
+/** Mobile: avoid resetting iOS audio pipeline by assigning playbackRate every frame. */
+let lastBgmPlaybackRateApplied = -99;
 /** Visual-only obstacles + coins down the track on the menu (not in `obstacles` / `coins`). */
 let lobbyBackdropDecorGroup = null;
 /** User already saw looping stretch on the menu; skip the post-Play intro. */
@@ -534,6 +540,13 @@ let nextSpawnZ = 20;
 /** Center Z of last hazard; used to enforce forward spacing. */
 let lastObstacleCenterZ = -1e9;
 let rng = mulberry32(0x9e3779b9);
+
+/**
+ * When true, phones/tablets skip HTML background music entirely (no fetch/decode) so you can test
+ * whether BGM was causing freezes or cutouts. Sky/grid still animate via procedural `sampleBgmBands`.
+ * Set to `false` to restore mobile BGM.
+ */
+const DISABLE_BGM_ON_MOBILE = true;
 
 /**
  * Background music: `public/sounds/` first (same folder as SFX), then `public/bgsound/`.
@@ -1087,6 +1100,11 @@ function isRunningBackward() {
 
 function updateRunSfx(dt) {
   if (!gameStarted || !runGameplayActive || !runAudio || !bgmUnlocked) return;
+  if (mobilePerf && mobileRunSfxDelayRemain > 0) {
+    mobileRunSfxDelayRemain -= dt;
+    if (runAudio && !runAudio.paused) runAudio.pause();
+    return;
+  }
   if (!alive) {
     if (!runAudio.paused) runAudio.pause();
     return;
@@ -1126,14 +1144,45 @@ function syncBgmPlayState() {
     bgmAudio.pause();
     return;
   }
-  const p = bgmAudio.play();
-  if (p) p.catch(() => {});
+  /** iOS/Safari: calling play() every frame while already playing can glitch or drop the track. */
+  if (bgmAudio.paused) {
+    const p = bgmAudio.play();
+    if (p) p.catch(() => {});
+  }
 }
 
 function revokeBgmBlobUrl() {
   if (bgmObjectUrl) {
     URL.revokeObjectURL(bgmObjectUrl);
     bgmObjectUrl = null;
+  }
+}
+
+/**
+ * WebKit: start BGM decode in the same user gesture as Play (pointerdown) so playback is not rejected;
+ * volume stays 0 until `unlockBgm` runs moments later.
+ */
+function tryPrimeBgmInUserGesture() {
+  if (!bgmAudio || bgmAudio.error) return;
+  try {
+    bgmAudio.volume = 0;
+    if (bgmAudio.paused) void bgmAudio.play().catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+function applyBgmPlaybackRateIfNeeded(rate, clampMin = 0.85, clampMax = 2) {
+  if (!bgmAudio) return;
+  const r = THREE.MathUtils.clamp(rate, clampMin, clampMax);
+  if (!mobilePerf) {
+    bgmAudio.playbackRate = r;
+    lastBgmPlaybackRateApplied = r;
+    return;
+  }
+  if (Math.abs(r - lastBgmPlaybackRateApplied) > 0.04 || Math.abs(r - bgmAudio.playbackRate) > 0.09) {
+    bgmAudio.playbackRate = r;
+    lastBgmPlaybackRateApplied = r;
   }
 }
 
@@ -1156,7 +1205,6 @@ function unlockBgm() {
   if (preferMobilePerf()) {
     requestAnimationFrame(() => {
       syncBgmPlayState();
-      if (runAudio && runGameplayActive && alive) void runAudio.play().catch(() => {});
     });
   }
 }
@@ -1175,7 +1223,7 @@ function updateBgmPlayback(dt) {
     const s = u * u * (3 - 2 * u);
     bgmAudio.volume = BGM_VOLUME * s;
     const targetRate = BGM_RATE_MIN + difficultyRampT * (BGM_RATE_MAX - BGM_RATE_MIN);
-    bgmAudio.playbackRate = THREE.MathUtils.clamp(targetRate, 0.85, 2);
+    applyBgmPlaybackRateIfNeeded(targetRate);
     syncBgmPlayState();
     return;
   }
@@ -1190,15 +1238,19 @@ function updateBgmPlayback(dt) {
   );
   if (isRunningBackward()) {
     if (bgmAudio.paused) void bgmAudio.play().catch(() => {});
-    bgmAudio.playbackRate = THREE.MathUtils.clamp(
-      targetRate * BGM_BACKWARD_TEMPO_MUL,
+    applyBgmPlaybackRateIfNeeded(
+      THREE.MathUtils.clamp(
+        targetRate * BGM_BACKWARD_TEMPO_MUL,
+        BGM_BACKWARD_TEMPO_MIN,
+        BGM_BACKWARD_TEMPO_MAX,
+      ),
       BGM_BACKWARD_TEMPO_MIN,
       BGM_BACKWARD_TEMPO_MAX,
     );
     syncBgmPlayState();
     return;
   }
-  bgmAudio.playbackRate = targetRate;
+  applyBgmPlaybackRateIfNeeded(targetRate);
   syncBgmPlayState();
 }
 
@@ -1702,6 +1754,8 @@ function startRunAnimationImmediately() {
   runGameplayActive = true;
   bgmIntroFadeActive = false;
   if (bgmAudio) bgmAudio.volume = BGM_VOLUME;
+  if (mobilePerf) mobileRunSfxDelayRemain = 1.35;
+  else mobileRunSfxDelayRemain = 0;
   restoreRunFacingAfterIntro();
   if (playerGroup && !playerGroup.userData.visualRoot) {
     playerGroup.rotation.y = 0;
@@ -4193,7 +4247,12 @@ function restart() {
   if (hudCoinsEl) hudCoinsEl.textContent = '0';
   if (hudScoreEl) hudScoreEl.textContent = '0';
   updateSpeedHud(baseSpeed);
-  if (bgmAudio) bgmAudio.playbackRate = BGM_RATE_MIN;
+  if (bgmAudio) {
+    bgmAudio.playbackRate = BGM_RATE_MIN;
+    lastBgmPlaybackRateApplied = BGM_RATE_MIN;
+  }
+  if (mobilePerf) mobileRunSfxDelayRemain = 1.35;
+  else mobileRunSfxDelayRemain = 0;
   pendingLandSfx = false;
   difficultyRampT = 0;
   tunnelRunLightEase = 0;
@@ -4784,7 +4843,8 @@ async function ensureRunAudioElement() {
  */
 async function preloadAudioPipeline(opts = {}) {
   const force = opts.force === true;
-  const bgmOk = !force && bgmAudio && !bgmAudio.error && bgmLoadReady;
+  const skipBgm = DISABLE_BGM_ON_MOBILE && preferMobilePerf();
+  const bgmOk = !skipBgm && !force && bgmAudio && !bgmAudio.error && bgmLoadReady;
   if (bgmOk) {
     if (Object.keys(sfxObjectUrls).length === 0) {
       sfxObjectUrls = await fetchAllSfxObjectUrls();
@@ -4793,7 +4853,7 @@ async function preloadAudioPipeline(opts = {}) {
     return;
   }
 
-  const bgmBlob = await fetchFirstWorkingBgmBlob();
+  const bgmBlob = skipBgm ? null : await fetchFirstWorkingBgmBlob();
   revokeAllSfxObjectUrls();
   sfxObjectUrls = await fetchAllSfxObjectUrls();
   revokeBgmBlobUrl();
@@ -4802,7 +4862,7 @@ async function preloadAudioPipeline(opts = {}) {
   bgmAnalyser = null;
   bgmFreqData = null;
   bgmTunnelLowpass = null;
-  if (bgmBlob) {
+  if (!skipBgm && bgmBlob) {
     bgmObjectUrl = URL.createObjectURL(bgmBlob);
     const a = new Audio(bgmObjectUrl);
     a.preload = 'auto';
@@ -4839,7 +4899,7 @@ async function preloadGraphicsPipeline() {
           console.warn('AstroRun: renderer.compile failed', err);
         }
       }
-      const warmFrames = mobilePerf ? 1 : 3;
+      const warmFrames = mobilePerf ? 2 : 3;
       for (let i = 0; i < warmFrames; i += 1) {
         renderer.render(scene, camera);
         await new Promise((r) => requestAnimationFrame(r));
@@ -4856,7 +4916,10 @@ async function preloadGraphicsPipeline() {
 
 function wireStartScreen() {
   if (!startBtnEl || !startScreenEl) return;
-  const primeTouchAudio = () => syncTouchGestureAudioUnlock();
+  const primeTouchAudio = () => {
+    syncTouchGestureAudioUnlock();
+    tryPrimeBgmInUserGesture();
+  };
   startBtnEl.addEventListener('pointerdown', primeTouchAudio, { capture: true });
   startBtnEl.addEventListener('touchstart', primeTouchAudio, { passive: true, capture: true });
   startBtnEl.addEventListener('click', async () => {
