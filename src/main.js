@@ -67,7 +67,7 @@ function beginInitialIntroOrRun() {
   stopLobbyRenderLoop();
   clearLobbyBackdropDecor();
   if (playerGroup) {
-    playerGroup.position.z = distance;
+    playerGroup.position.z = sceneTrackZ(distance);
     playerGroup.position.x = targetLaneX;
   }
   const hadLobbyStretch = lobbyStretchWasPlaying;
@@ -273,8 +273,38 @@ let scene, camera, renderer;
 let mobilePerf = false;
 /** Frame counter for lobby + game loop (hologram uniform throttle). */
 let renderFrameIndex = 0;
-/** Mobile: accumulate dt for half-rate skeletal animation updates. */
-let playerMixerDtAccum = 0;
+/**
+ * GPU / matrix precision: periodically shift the track in −Z so scene coordinates stay moderate.
+ * Score / tunnel logic still use logical `distance`; spawned meshes use `sceneTrackZ`.
+ */
+const Z_REBASE_TRIGGER = 2200;
+const Z_REBASE_STEP = 2000;
+let worldZShift = 0;
+/** Frame delta via `THREE.Clock.getDelta()` (clamped); started in `init`. */
+const gameLoopClock = new THREE.Clock(false);
+
+function sceneTrackZ(logicalZ) {
+  return logicalZ - worldZShift;
+}
+
+function maybeRebaseWorldZTrack() {
+  if (!worldGroup || !gameStarted || !alive || !runGameplayActive) return;
+  let guard = 0;
+  while (distance - worldZShift > Z_REBASE_TRIGGER && guard < 10) {
+    guard += 1;
+    const dz = Z_REBASE_STEP;
+    worldZShift += dz;
+    worldGroup.position.z -= dz;
+    for (let i = 0; i < obstacles.length; i++) obstacles[i].mesh.position.z -= dz;
+    for (let i = 0; i < coins.length; i++) coins[i].mesh.position.z -= dz;
+    for (let i = 0; i < boostPads.length; i++) boostPads[i].mesh.position.z -= dz;
+    for (let i = 0; i < powerPads.length; i++) powerPads[i].mesh.position.z -= dz;
+    nextSpawnZ -= dz;
+    if (lastObstacleCenterZ > -1e8) lastObstacleCenterZ -= dz;
+    tunnelWorldLayoutGen += 1;
+  }
+}
+
 /** Bumped when runway chunks are added (`spawnChunk`); invalidates tunnel Z cache. */
 let tunnelWorldLayoutGen = 0;
 const tunnelStripeAtZCache = new Map();
@@ -302,7 +332,6 @@ let lobbyStretchWasPlaying = false;
 /** Looping menu stretch clip (separate from one-shot `playerStartAction`). */
 let playerLobbyStretchAction = null;
 let lobbyLoopRafId = 0;
-let lobbyLastTime = 0;
 let playerGroup;
 /** GLTF run cycle; null while using block placeholder. */
 let playerMixer = null;
@@ -611,6 +640,7 @@ function makeRunwaySlabShaderMaterial() {
 
   const baseUniforms = {
     uScroll: { value: 0 },
+    uWorldZShift: { value: 0 },
     uTime: { value: 0 },
     uPulse: { value: 0 },
     uImpact: { value: 0 },
@@ -643,6 +673,7 @@ function makeRunwaySlabShaderMaterial() {
       uniform float uFootFlash;
       uniform float uPlayerX;
       uniform float uPlayerZ;
+      uniform float uWorldZShift;
       uniform float uFogNear;
       uniform float uFogFar;
       uniform vec3 uFogColor;
@@ -651,7 +682,7 @@ function makeRunwaySlabShaderMaterial() {
       void main() {
         float tun = clamp(uTunnelFloorBright, 0.0, 1.0);
         float ax = abs(vWPos.x);
-        float z = vWPos.z + uScroll;
+        float z = vWPos.z + uWorldZShift + uScroll;
         float toL = abs(vWPos.x + uLaneW);
         float toC = abs(vWPos.x);
         float toR = abs(vWPos.x - uLaneW);
@@ -734,6 +765,7 @@ function makeRunwaySlabShaderMaterial() {
       uniform float uFootFlash;
       uniform float uPlayerX;
       uniform float uPlayerZ;
+      uniform float uWorldZShift;
       uniform float uFogNear;
       uniform float uFogFar;
       uniform vec3 uFogColor;
@@ -742,7 +774,7 @@ function makeRunwaySlabShaderMaterial() {
       void main() {
         float tun = clamp(uTunnelFloorBright, 0.0, 1.0);
         float ax = abs(vWPos.x);
-        float z = vWPos.z + uScroll;
+        float z = vWPos.z + uWorldZShift + uScroll;
 
         float toL = abs(vWPos.x + uLaneW);
         float toC = abs(vWPos.x);
@@ -762,7 +794,7 @@ function makeRunwaySlabShaderMaterial() {
         float mist = 0.5 + 0.5 * sin(z * 0.07 + uTime * 0.9 + vWPos.x * 0.12);
         vec3 haze = mix(uMagenta * 0.2, uCyan * 0.22, mist);
 
-        float depth = smoothstep(100.0, -15.0, vWPos.z);
+        float depth = smoothstep(100.0, -15.0, vWPos.z + uWorldZShift);
         float beat = 0.34 + uPulse * 0.3;
         float intf = sin(z * 0.32 + uTime * 2.0) * sin(ax * 2.0 - uTime * 1.55) * 0.5 + 0.5;
         float scanY = sin(vWPos.y * 16.0 - uTime * 4.0) * 0.5 + 0.5;
@@ -1493,7 +1525,7 @@ function introCamZoomCloseAmount(u) {
 
 function updateIntroCamera() {
   if (!camera || !playerGroup || !introCameraActive) return;
-  const pz = distance;
+  const pz = sceneTrackZ(distance);
   const denom = Math.max(introCameraDuration, 0.2);
   const u = Math.min(1, introCameraElapsed / denom);
   const closeAmt = introCamZoomCloseAmount(u);
@@ -1586,29 +1618,20 @@ function stopLobbyRenderLoop() {
   }
 }
 
-function lobbyLoop(now) {
+function lobbyLoop() {
   if (gameStarted) return;
   if (!graphicsInited || !renderer || !scene || !camera) {
     lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
     return;
   }
   renderFrameIndex += 1;
-  const dt = lobbyLastTime ? Math.min(0.05, (now - lobbyLastTime) / 1000) : 0.016;
-  lobbyLastTime = now;
+  const dt = Math.min(0.05, gameLoopClock.getDelta());
   holoTime += dt;
   ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
   if (playerGroup) playerGroup.position.z = LOBBY_RUNNER_ANCHOR_Z;
   applyLobbyCameraPose();
   if (playerMixer) {
-    if (mobilePerf) {
-      playerMixerDtAccum += dt;
-      if ((renderFrameIndex & 1) === 0) {
-        playerMixer.update(playerMixerDtAccum);
-        playerMixerDtAccum = 0;
-      }
-    } else {
-      playerMixer.update(dt);
-    }
+    playerMixer.update(dt);
   }
   if (lobbyBackdropDecorGroup) {
     lobbyBackdropDecorGroup.traverse((o) => {
@@ -1623,7 +1646,6 @@ function lobbyLoop(now) {
 
 function startLobbyRenderLoop() {
   stopLobbyRenderLoop();
-  lobbyLastTime = performance.now();
   lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
 }
 
@@ -1715,7 +1737,7 @@ function finishStartIntroAndRun() {
     playerStartAction = null;
   }
   startRunAnimationImmediately();
-  last = performance.now();
+  gameLoopClock.start();
 }
 
 function setupPlayerStartIntro(startClip) {
@@ -3307,12 +3329,13 @@ function spawnObstacle(z, travelSpeed) {
   let kind;
   let extra = {};
 
+  const sz = sceneTrackZ(z);
   if (roll < 0.36) {
     kind = 'train';
     const { core, edge } = sampleHazardHologramColors();
     const mat = acquireHazardHoloMaterial(core, edge, 0.34, 0.92, rng() * Math.PI * 2);
     mesh = new THREE.Mesh(getGeoHazardTrain(), mat);
-    mesh.position.set(laneX(lane), 0.75, z);
+    mesh.position.set(laneX(lane), 0.75, sz);
   } else if (roll < 0.62) {
     kind = 'gap';
     const px = playerGroup ? playerGroup.position.x : 0;
@@ -3327,7 +3350,7 @@ function spawnObstacle(z, travelSpeed) {
     const { core, edge } = sampleHazardHologramColors();
     const ph = rng() * Math.PI * 2;
     mesh = new THREE.Group();
-    mesh.position.set(0, 0, z);
+    mesh.position.set(0, 0, sz);
     const h = 1.35;
     const bwMul = 0.9;
     if (g0 > TRACK_X_MIN + 0.04) {
@@ -3362,7 +3385,7 @@ function spawnObstacle(z, travelSpeed) {
     const { core, edge } = sampleHazardHologramColors();
     const mat = acquireHazardHoloMaterial(core, edge, 0.36, 0.9, rng() * Math.PI * 2);
     mesh = new THREE.Mesh(getGeoHazardLow(), mat);
-    mesh.position.set(laneX(lane), 0.22, z);
+    mesh.position.set(laneX(lane), 0.22, sz);
   }
 
   mesh.castShadow = false;
@@ -3377,7 +3400,7 @@ function spawnCoinRow(z) {
   for (let i = 0; i < n; i++) {
     const visual = cloneCoinVisual();
     const zz = z + i * 1.1;
-    visual.position.set(laneX(lane), 0.55, zz);
+    visual.position.set(laneX(lane), 0.55, sceneTrackZ(zz));
     if (visual.userData.isCoinGltf) {
       visual.rotation.y = rng() * Math.PI * 2;
       visual.rotation.x = 0.52;
@@ -3414,7 +3437,7 @@ function spawnPurpleJumpCoinRow(z, lane) {
     applyPurpleTunnelCoinTint(visual);
     const cy =
       PURPLE_JUMP_COIN_Y + (rng() - 0.5) * 2 * PURPLE_JUMP_COIN_Y_JITTER;
-    visual.position.set(laneX(lane), cy, zz);
+    visual.position.set(laneX(lane), cy, sceneTrackZ(zz));
     visual.scale.multiplyScalar(1.32);
     if (visual.userData.isCoinGltf) {
       visual.rotation.y = rng() * Math.PI * 2;
@@ -3456,7 +3479,7 @@ function spawnMegaRoofCoinsAlongRow(z, n, lane) {
     idx += 1;
     const visual = cloneCoinVisual();
     applyPurpleTunnelCoinTint(visual);
-    visual.position.set(laneX(useLane), y, zz);
+    visual.position.set(laneX(useLane), y, sceneTrackZ(zz));
     visual.scale.multiplyScalar(1.48);
     if (visual.userData.isCoinGltf) {
       visual.rotation.y = rng() * Math.PI * 2;
@@ -3495,7 +3518,7 @@ function spawnPurpleTunnelRoofTrail(z0, lengthZ) {
     laneRot += 1 + Math.floor(rng() * 2);
     const visual = cloneCoinVisual();
     applyPurpleTunnelCoinTint(visual);
-    visual.position.set(laneX(useLane), y, zz);
+    visual.position.set(laneX(useLane), y, sceneTrackZ(zz));
     visual.scale.multiplyScalar(1.42);
     if (visual.userData.isCoinGltf) {
       visual.rotation.y = rng() * Math.PI * 2;
@@ -3528,7 +3551,7 @@ function spawnBoostPad(z, opts = {}) {
   const d = BOOST_PAD_DEPTH;
   const geo = makeCurvedJumpPadGeometry(w, d);
   const mesh = new THREE.Mesh(geo, makeBoostHologramMaterial(decoy));
-  mesh.position.set(laneX(lane), 0.028, z);
+  mesh.position.set(laneX(lane), 0.028, sceneTrackZ(z));
   mesh.receiveShadow = false;
   mesh.castShadow = false;
   scene.add(mesh);
@@ -3541,7 +3564,7 @@ function spawnPowerPad(z) {
   const d = POWER_PAD_DEPTH;
   const h = 0.09;
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), makePowerPadMaterial());
-  mesh.position.set(laneX(lane), h / 2 + 0.02, z);
+  mesh.position.set(laneX(lane), h / 2 + 0.02, sceneTrackZ(z));
   mesh.receiveShadow = false;
   mesh.castShadow = false;
   scene.add(mesh);
@@ -3831,6 +3854,7 @@ function updateMusicReactiveVisuals(dt) {
   /** Keep deck ring + scroll aligned with lane strafe every frame (cheap uniforms only). */
   if (mobilePerf && runwaySlabMat?.uniforms && playerGroup) {
     runwaySlabMat.uniforms.uScroll.value = distance;
+    if (runwaySlabMat.uniforms.uWorldZShift) runwaySlabMat.uniforms.uWorldZShift.value = worldZShift;
     runwaySlabMat.uniforms.uTime.value = musicPulseTime;
     if (runwaySlabMat.uniforms.uPlayerX) runwaySlabMat.uniforms.uPlayerX.value = playerGroup.position.x;
     if (runwaySlabMat.uniforms.uPlayerZ) runwaySlabMat.uniforms.uPlayerZ.value = playerGroup.position.z;
@@ -3904,6 +3928,7 @@ function updateMusicReactiveVisuals(dt) {
 
   if (runwaySlabMat?.uniforms) {
     runwaySlabMat.uniforms.uScroll.value = distance;
+    if (runwaySlabMat.uniforms.uWorldZShift) runwaySlabMat.uniforms.uWorldZShift.value = worldZShift;
     runwaySlabMat.uniforms.uTime.value = musicPulseTime;
     const pulseTarget = !gameStarted
       ? 0.18 + 0.11 * (0.5 + 0.5 * Math.sin(musicPulseTime * 1.05))
@@ -4090,6 +4115,8 @@ function init() {
     };
     canvas.addEventListener('touchstart', kickMobileAudio, { passive: true });
   }
+
+  gameLoopClock.start();
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !gameStarted || !alive) return;
@@ -4342,6 +4369,8 @@ function restart() {
   powerSpeedRemain = 0;
 
   while (worldGroup.children.length) worldGroup.remove(worldGroup.children[0]);
+  worldZShift = 0;
+  worldGroup.position.z = 0;
   tunnelWorldLayoutGen += 1;
   let zEnd = 0;
   const restartChunks = mobilePerf ? 3 : 6;
@@ -4508,6 +4537,11 @@ function tick(dt) {
   }
   updateSpeedHud(travelSpeed);
 
+  maybeRebaseWorldZTrack();
+  playerGroup.position.z = sceneTrackZ(distance);
+  const pzLogical = distance;
+  const pzScene = playerGroup.position.z;
+
   playerGroup.position.x = THREE.MathUtils.lerp(
     playerGroup.position.x,
     targetLaneX,
@@ -4661,13 +4695,10 @@ function tick(dt) {
     vRoot.position.y = gy + hop * 0.12 * (1 - duckAmount) - duckAmount * 0.38;
   }
 
-  const pz = distance;
-  playerGroup.position.z = pz;
-
   const rect = playerXZRect();
 
   for (const o of obstacles) {
-    if (o.mesh.position.z < pz - 3) continue;
+    if (o.mesh.position.z < pzScene - 3) continue;
     if (overlapsObstacle(rect, o)) {
       landShakeMag = Math.max(landShakeMag, OBSTACLE_HIT_SHAKE_MAG);
       landShakePhase = holoTime * 41;
@@ -4681,7 +4712,7 @@ function tick(dt) {
     }
   }
 
-  cameraGameplayBasePos.z = pz - CAM_GAME_Z_OFFSET;
+  cameraGameplayBasePos.z = pzScene - CAM_GAME_Z_OFFSET;
   cameraGameplayBasePos.x = THREE.MathUtils.lerp(
     cameraGameplayBasePos.x,
     playerGroup.position.x * 0.35,
@@ -4697,10 +4728,10 @@ function tick(dt) {
   decayLandShake(dt);
   applyLandShakeToCamera();
   const lookY = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
-  camera.lookAt(playerGroup.position.x * 0.4, lookY, pz + 10);
+  camera.lookAt(playerGroup.position.x * 0.4, lookY, pzScene + 10);
 
   const spawnLookahead = mobilePerf ? 40 : 78;
-  while (nextSpawnZ < pz + spawnLookahead) {
+  while (nextSpawnZ < pzLogical + spawnLookahead) {
     const roll = rng();
     if (roll < 0.38) {
       spawnObstacle(nextSpawnZ + 10 + rng() * 8, travelSpeed);
@@ -4730,10 +4761,10 @@ function tick(dt) {
 
   const oldest = worldGroup.children[0];
   const chunkDropBehind = mobilePerf ? 14 : 22;
-  if (oldest?.userData.zEnd != null && pz > oldest.userData.zEnd + chunkDropBehind) {
+  if (oldest?.userData.zEnd != null && pzLogical > oldest.userData.zEnd + chunkDropBehind) {
     worldGroup.remove(oldest);
     const last = worldGroup.children[worldGroup.children.length - 1];
-    const lastEnd = last?.userData.zEnd ?? pz + 40;
+    const lastEnd = last?.userData.zEnd ?? pzLogical + 40;
     spawnChunk(lastEnd);
   }
 
@@ -4743,7 +4774,7 @@ function tick(dt) {
     if (pad.used || pad.decoy) continue;
     const mx = pad.mesh.position.x;
     const mz = pad.mesh.position.z;
-    if (Math.abs(mz - pz) > padHalfD + 0.35) continue;
+    if (Math.abs(mz - pzScene) > padHalfD + 0.35) continue;
     if (rect.minX > mx + padHalfW || rect.maxX < mx - padHalfW) continue;
     if (rect.minZ > mz + padHalfD || rect.maxZ < mz - padHalfD) continue;
     if (playerY > 0.42) continue;
@@ -4767,7 +4798,7 @@ function tick(dt) {
     if (pad.used) continue;
     const mx = pad.mesh.position.x;
     const mz = pad.mesh.position.z;
-    if (Math.abs(mz - pz) > powerHalfD + 0.35) continue;
+    if (Math.abs(mz - pzScene) > powerHalfD + 0.35) continue;
     if (rect.minX > mx + powerHalfW || rect.maxX < mx - powerHalfW) continue;
     if (rect.minZ > mz + powerHalfD || rect.maxZ < mz - powerHalfD) continue;
     if (playerY > 0.42) continue;
@@ -4799,9 +4830,9 @@ function tick(dt) {
       continue;
     }
     if (c.collected) continue;
-    if (Math.abs(c.mesh.position.z - pz) > 0.55) {
+    if (Math.abs(c.mesh.position.z - pzScene) > 0.55) {
       /** Matches old loop order: cull removes far coins before idle spin. */
-      if (c.mesh.position.z >= pz - 25) spinIdleCoin(c);
+      if (c.mesh.position.z >= pzScene - 25) spinIdleCoin(c);
       continue;
     }
     if (Math.abs(c.mesh.position.x - playerGroup.position.x) > 0.65) {
@@ -4847,7 +4878,7 @@ function tick(dt) {
   if (hudScoreEl) hudScoreEl.textContent = String(calcRunScore(metersInt, coinCount));
 
   for (let i = obstacles.length - 1; i >= 0; i--) {
-    if (obstacles[i].mesh.position.z < pz - 25) {
+    if (obstacles[i].mesh.position.z < pzScene - 25) {
       disposeObstacleVisualResources(obstacles[i].mesh);
       scene.remove(obstacles[i].mesh);
       obstacles.splice(i, 1);
@@ -4861,11 +4892,11 @@ function tick(dt) {
       coins.splice(i, 1);
       continue;
     }
-    if (!c.collected && c.mesh.position.z < pz - 25) {
+    if (!c.collected && c.mesh.position.z < pzScene - 25) {
       scene.remove(c.mesh);
       disposeObjectSubtree(c.mesh);
       coins.splice(i, 1);
-    } else if (c.collected && c.mesh.position.z < pz - 48) {
+    } else if (c.collected && c.mesh.position.z < pzScene - 48) {
       scene.remove(c.mesh);
       disposeObjectSubtree(c.mesh);
       coins.splice(i, 1);
@@ -4873,13 +4904,13 @@ function tick(dt) {
   }
 
   for (let i = boostPads.length - 1; i >= 0; i--) {
-    if (boostPads[i].mesh.position.z < pz - 22) {
+    if (boostPads[i].mesh.position.z < pzScene - 22) {
       scene.remove(boostPads[i].mesh);
       boostPads.splice(i, 1);
     }
   }
   for (let i = powerPads.length - 1; i >= 0; i--) {
-    if (powerPads[i].mesh.position.z < pz - 22) {
+    if (powerPads[i].mesh.position.z < pzScene - 22) {
       scene.remove(powerPads[i].mesh);
       powerPads.splice(i, 1);
     }
@@ -4888,13 +4919,11 @@ function tick(dt) {
   syncTunnelNeonUniforms(dt);
 }
 
-let last = performance.now();
-function loop(now) {
+function loop() {
   if (!graphicsInited || !renderer) return;
   if (gameStarted) stopLobbyRenderLoop();
   renderFrameIndex += 1;
-  const dt = Math.min(0.05, (now - last) / 1000);
-  last = now;
+  const dt = Math.min(0.05, gameLoopClock.getDelta());
   holoTime += dt;
   const wasAliveBeforeTick = alive;
   tick(dt);
@@ -4905,7 +4934,7 @@ function loop(now) {
       landShakeMag = 0;
     }
     applyLandShakeToCamera();
-    const pzDead = distance;
+    const pzDead = playerGroup.position.z;
     const lookYDead = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
     camera.lookAt(playerGroup.position.x * 0.4, lookYDead, pzDead + 10);
   }
@@ -4915,15 +4944,7 @@ function loop(now) {
   }
   if (playerRunAction && gameStarted && !alive) playerRunAction.timeScale = 0;
   if (playerMixer) {
-    if (mobilePerf) {
-      playerMixerDtAccum += dt;
-      if ((renderFrameIndex & 1) === 0) {
-        playerMixer.update(playerMixerDtAccum);
-        playerMixerDtAccum = 0;
-      }
-    } else {
-      playerMixer.update(dt);
-    }
+    playerMixer.update(dt);
   }
   updateBgmPlayback(dt);
   updateRunSfx(dt);
@@ -5048,7 +5069,7 @@ function wireStartScreen() {
       unlockBgm();
       if (startStatusEl) startStatusEl.textContent = '';
       beginInitialIntroOrRun();
-      last = performance.now();
+      gameLoopClock.start();
       requestAnimationFrame(loop);
     } catch (err) {
       console.error('Game failed to start', err);
