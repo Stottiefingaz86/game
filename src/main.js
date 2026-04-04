@@ -872,14 +872,22 @@ function resolveBlenderNlaStyleClips(animations) {
   };
 }
 
-/** Three motion clips, any names: longest = hold/stretch, middle = jump, shortest = run (same as NLA). */
+/**
+ * Three+ motion clips, any names: longest = hold/stretch, second-shortest = jump, shortest = run
+ * (same convention as NLA 3-pack and `resolveBlenderNlaStyleClips` for 4+ tracks).
+ * Requires **at least** three clips — exports with a bind pose + 3 motions were previously rejected
+ * when `pool.length === 4` and jump never resolved.
+ */
 function resolveThreeClipDurationPack(animations) {
   if (!animations?.length) return null;
   const lower = animations.map((c) => c.name.toLowerCase());
   const pool = animations.filter((_, i) => !isBindOrPoseClipName(lower[i]));
-  if (pool.length !== 3) return null;
+  if (pool.length < 3) return null;
   const sorted = [...pool].sort((a, b) => (b.duration || 0) - (a.duration || 0));
-  return { run: sorted[2], jump: sorted[1] };
+  const run = sorted[sorted.length - 1];
+  const jump = sorted[sorted.length - 2];
+  if (!run || !jump || run === jump) return null;
+  return { run, jump };
 }
 
 function pickRunAnimationClip(clips) {
@@ -1174,19 +1182,18 @@ function removePlayerJumpFinishedListener() {
 
 function resumeRunAfterJumpAnim() {
   if (!playerJumpAnimOverride) return;
-  if (jumpAnimWatchdog != null) {
-    window.clearTimeout(jumpAnimWatchdog);
-    jumpAnimWatchdog = null;
-  }
+  removePlayerJumpFinishedListener();
   if (!playerRunAction || !playerJumpAction || !playerMixer) {
     playerJumpAnimOverride = false;
     return;
   }
   playerJumpAnimOverride = false;
+  playerJumpAction.stopFading();
   playerJumpAction.stop();
   playerJumpAction.setEffectiveWeight(0);
   playerJumpAction.enabled = false;
   playerJumpAction.paused = true;
+  playerRunAction.stopFading();
   playerRunAction.enabled = true;
   playerRunAction.reset();
   playerRunAction.setLoop(THREE.LoopRepeat, Infinity);
@@ -1272,10 +1279,13 @@ async function tryLoadExternalJumpClip(playerRoot) {
   return null;
 }
 
+/** Run → jump: short crossfade so the rig doesn’t pop or freeze at a hard stop/disable. */
+const PLAYER_RUN_TO_JUMP_CROSSFADE = 0.11;
+
 function playPlayerJumpAnimation() {
   if (!playerMixer || !playerRunAction) return;
-  const root = playerMixer.getRoot();
-  const jumpRef = root?.userData?.playerJumpClipRef;
+  const jumpRef =
+    playerMixer.userData?.playerJumpClipRef ?? playerMixer.getRoot()?.userData?.playerJumpClipRef;
   if (!jumpRef?.tracks?.length || !isUsableAnimClip(jumpRef)) return;
   const runClip = playerRunAction.getClip();
   if (!runClip || jumpRef.uuid === runClip.uuid) return;
@@ -1289,18 +1299,35 @@ function playPlayerJumpAnimation() {
   }
   playerJumpAnimOverride = true;
   removePlayerJumpFinishedListener();
-  playerRunAction.stop();
-  playerRunAction.setEffectiveWeight(0);
-  playerRunAction.paused = true;
-  playerRunAction.enabled = false;
+
+  const fadeSec = PLAYER_RUN_TO_JUMP_CROSSFADE;
+  playerJumpAction.stopFading();
+  playerRunAction.stopFading();
   playerJumpAction.enabled = true;
   playerJumpAction.paused = false;
-  playerJumpAction.stop();
   playerJumpAction.reset();
   playerJumpAction.setLoop(THREE.LoopOnce, 1);
   playerJumpAction.clampWhenFinished = true;
+  /**
+   * `crossFadeTo` uses fadeIn: effectiveWeight = `this.weight` × fade interpolant (0→1).
+   * If `weight` is 0, jump never influences the skeleton (looks like a frozen pose).
+   */
   playerJumpAction.setEffectiveWeight(1);
   playerJumpAction.play();
+
+  if (playerRunAction.isRunning() && playerRunAction.getEffectiveWeight() > 0.01) {
+    playerRunAction.enabled = true;
+    playerRunAction.paused = false;
+    playerRunAction.crossFadeTo(playerJumpAction, fadeSec, false);
+  } else {
+    playerJumpAction.stopFading();
+    playerJumpAction.setEffectiveWeight(1);
+    playerRunAction.stop();
+    playerRunAction.setEffectiveWeight(0);
+    playerRunAction.paused = true;
+    playerRunAction.enabled = false;
+  }
+
   const handler = (e) => {
     if (e.action !== playerJumpAction || !playerRunAction) return;
     resumeRunAfterJumpAnim();
@@ -1311,7 +1338,7 @@ function playPlayerJumpAnimation() {
   jumpAnimWatchdog = window.setTimeout(() => {
     jumpAnimWatchdog = null;
     if (playerJumpAnimOverride) resumeRunAfterJumpAnim();
-  }, (dur + 0.45) * 1000);
+  }, (dur + 0.45 + fadeSec) * 1000);
 }
 
 /**
@@ -1459,6 +1486,31 @@ function cloneCoinVisual() {
   return makeFallbackCoinVisual();
 }
 
+/** Roof “mega” coins: obvious purple so they read on top of tunnels. */
+function applyPurpleTunnelCoinTint(root) {
+  const core = new THREE.Color().setHSL(0.76, 0.78, 0.5);
+  const edge = new THREE.Color().setHSL(0.8, 1, 0.68);
+  root.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    for (const m of mats) {
+      if (!m) continue;
+      if (m.uniforms?.uCoreColor && m.uniforms?.uEdgeColor) {
+        m.uniforms.uCoreColor.value.copy(core);
+        m.uniforms.uEdgeColor.value.copy(edge);
+        m.needsUpdate = true;
+      } else if (m.color) {
+        m.color.copy(core);
+        if (m.emissive) {
+          m.emissive.copy(edge);
+          m.emissiveIntensity = Math.max(m.emissiveIntensity || 0, 0.52);
+        }
+        m.needsUpdate = true;
+      }
+    }
+  });
+}
+
 function clearPlayerVisuals() {
   removePlayerJumpFinishedListener();
   removePlayerStartIntroListener();
@@ -1570,6 +1622,8 @@ async function loadAndApplyPlayerCharacter() {
       const jumpSetupGen = jumpAnimSetupGeneration;
       introSetupGeneration += 1;
       playerMixer = new THREE.AnimationMixer(model);
+      /** AnimationMixer is not an Object3D — it has no `userData` until we add it (clip refs, event handler ids). */
+      playerMixer.userData = {};
       playerRunAction = playerMixer.clipAction(clip);
       playerRunAction.reset();
       playerRunAction.setLoop(THREE.LoopRepeat, Infinity);
@@ -1616,6 +1670,8 @@ async function loadAndApplyPlayerCharacter() {
 
       model.userData.playerRunClipRef = clip;
       model.userData.playerJumpClipRef = jumpClipFinal || null;
+      playerMixer.userData.playerRunClipRef = clip;
+      playerMixer.userData.playerJumpClipRef = jumpClipFinal || null;
       if (jumpClipFinal) setupPlayerJumpAction(jumpClipFinal);
 
       startRunAnimationImmediately();
@@ -1735,6 +1791,17 @@ function isPlayerOnTunnelRoof(opts = {}) {
     playerY >= roofTopY - 0.12 &&
     playerY <= roofTopY + 0.4 &&
     playerVy <= vyMax
+  );
+}
+
+/** Jump on tunnel roof: looser vertical velocity than duck, so small gravity/snap ticks still allow a hop. */
+function canPlayerJumpFromTunnelRoof() {
+  if (!getTunnelStripeAtZ(distance)) return false;
+  const { roofTopY } = tunnelGeomConsts();
+  return (
+    playerY >= roofTopY - 0.16 &&
+    playerY <= roofTopY + 0.52 &&
+    playerVy <= 0.55
   );
 }
 
@@ -2207,15 +2274,63 @@ function spawnCoinRow(z) {
   if (zRangeOverlapsAnyTunnel(z - 1, rowEnd + 1)) spawnMegaRoofCoinsAlongRow(z, n, lane);
 }
 
-/** Larger coins on tunnel ceiling; worth 2×; only collectible while on the roof. */
+/**
+ * Larger purple coins on tunnel roof along a ground row’s Z span; denser spacing + lane weave
+ * so more actually appear inside the tunnel stripe (per-zz tunnel check).
+ */
 function spawnMegaRoofCoinsAlongRow(z, n, lane) {
   const { roofTopY } = tunnelGeomConsts();
   const y = roofTopY + 0.55;
-  for (let i = 0; i < n; i++) {
-    const zz = z + i * 1.1;
+  const rowEnd = z + (n - 1) * 1.1;
+  const laneBase = LANES.indexOf(lane);
+  let idx = 0;
+  for (let zz = z; zz <= rowEnd + 0.02; zz += 0.72) {
     if (!getTunnelStripeAtZ(zz)) continue;
+    const li = ((laneBase >= 0 ? laneBase : 1) + idx) % 3;
+    const useLane = LANES[li];
+    idx += 1;
     const visual = cloneCoinVisual();
-    visual.position.set(laneX(lane), y, zz);
+    applyPurpleTunnelCoinTint(visual);
+    visual.position.set(laneX(useLane), y, zz);
+    visual.scale.multiplyScalar(1.48);
+    if (visual.userData.isCoinGltf) {
+      visual.rotation.y = rng() * Math.PI * 2;
+      visual.rotation.x = 0.52;
+      visual.rotation.z = rng() * 0.28 - 0.14;
+    } else if (!visual.userData.isFallbackCoin) {
+      visual.rotation.y = rng() * Math.PI * 2;
+    }
+    scene.add(visual);
+    coins.push({
+      mesh: visual,
+      z: zz,
+      lane: useLane,
+      collected: false,
+      collecting: false,
+      collectTime: 0,
+      baseScale: visual.scale.x,
+      pendingDispose: false,
+      mega: true,
+      tunnelPurple: true,
+      coinValue: 2,
+    });
+  }
+}
+
+/** Long purple coin trail on tunnel ceiling (only spawns at Z where a tunnel exists). */
+function spawnPurpleTunnelRoofTrail(z0, lengthZ) {
+  const { roofTopY } = tunnelGeomConsts();
+  const y = roofTopY + 0.55;
+  const step = 0.86;
+  let laneRot = Math.floor(rng() * 3);
+  for (let t = 0; t < lengthZ; t += step) {
+    const zz = z0 + t;
+    if (!getTunnelStripeAtZ(zz)) continue;
+    const useLane = LANES[laneRot % 3];
+    laneRot += 1 + Math.floor(rng() * 2);
+    const visual = cloneCoinVisual();
+    applyPurpleTunnelCoinTint(visual);
+    visual.position.set(laneX(useLane), y, zz);
     visual.scale.multiplyScalar(1.42);
     if (visual.userData.isCoinGltf) {
       visual.rotation.y = rng() * Math.PI * 2;
@@ -2224,29 +2339,18 @@ function spawnMegaRoofCoinsAlongRow(z, n, lane) {
     } else if (!visual.userData.isFallbackCoin) {
       visual.rotation.y = rng() * Math.PI * 2;
     }
-    visual.traverse((o) => {
-      if (!o.isMesh || !o.material) return;
-      const mats = Array.isArray(o.material) ? o.material : [o.material];
-      const cloned = mats.map((m) => (m ? m.clone() : m));
-      o.material = cloned.length === 1 ? cloned[0] : cloned;
-      for (const m of cloned) {
-        if (m?.emissive) {
-          m.emissive.multiplyScalar(1.35);
-          m.needsUpdate = true;
-        }
-      }
-    });
     scene.add(visual);
     coins.push({
       mesh: visual,
       z: zz,
-      lane,
+      lane: useLane,
       collected: false,
       collecting: false,
       collectTime: 0,
       baseScale: visual.scale.x,
       pendingDispose: false,
       mega: true,
+      tunnelPurple: true,
       coinValue: 2,
     });
   }
@@ -2769,7 +2873,7 @@ function tryJump() {
   if (!alive) return;
   if (!runGameplayActive) return;
   const onDeck = playerY <= JUMP_GROUND_Y_MAX;
-  if (onDeck || isPlayerOnTunnelRoof({ vyMax: 0.12 })) {
+  if (onDeck || canPlayerJumpFromTunnelRoof()) {
     playerVy = JUMP_V;
     pendingLandSfx = true;
     playJumpSfx();
@@ -3085,6 +3189,7 @@ function tick(dt) {
       bumpRunwayFootImpact(0.42);
       skipNextFootstepDetect = true;
       pendingLandSfx = false;
+      if (playerJumpAnimOverride) resumeRunAfterJumpAnim();
     } else if (
       playerVy <= 0.22 &&
       playerY >= roofTopY - 0.42 &&
@@ -3092,6 +3197,7 @@ function tick(dt) {
     ) {
       playerY = roofTopY;
       playerVy = 0;
+      if (playerJumpAnimOverride) resumeRunAfterJumpAnim();
     }
   }
 
@@ -3105,6 +3211,7 @@ function tick(dt) {
       landShakePhase = musicPulseTime * 18;
       if (pendingLandSfx) playLandSfx();
     }
+    if (playerJumpAnimOverride) resumeRunAfterJumpAnim();
     pendingLandSfx = false;
   }
   playerGroup.position.y = playerY;
@@ -3221,10 +3328,14 @@ function tick(dt) {
     } else if (roll < 0.62) {
       spawnCoinRow(nextSpawnZ + 5);
       nextSpawnZ += 5 + rng() * 7;
-    } else if (roll < 0.71) {
+    } else if (roll < 0.685) {
+      const zTrail = nextSpawnZ + 6 + rng() * 12;
+      spawnPurpleTunnelRoofTrail(zTrail, 38 + rng() * 58);
+      nextSpawnZ += 9 + rng() * 10;
+    } else if (roll < 0.775) {
       spawnPowerPad(nextSpawnZ + 6 + rng() * 5);
       nextSpawnZ += 5 + rng() * 7;
-    } else if (roll < 0.8) {
+    } else if (roll < 0.865) {
       const wantZ = nextSpawnZ + 6 + rng() * 5;
       const { z: bz, ok } = findBoostZOutsideTunnel(wantZ);
       spawnBoostPad(ok ? bz : wantZ, { decoy: !ok });
@@ -3255,7 +3366,7 @@ function tick(dt) {
     if (rect.minZ > mz + padHalfD || rect.maxZ < mz - padHalfD) continue;
     if (playerY > 0.42) continue;
     pad.used = true;
-    pendingLandSfx = false;
+    pendingLandSfx = true;
     playBoostSfx();
     bumpRunwayFootImpact(0.72);
     skipNextFootstepDetect = true;
@@ -3265,6 +3376,7 @@ function tick(dt) {
     speedBoostRemain = BOOST_SPEED_SEC;
     boostRampRemain = Math.max(boostRampRemain, BOOST_PAD_ACCEL_SEC);
     setPadUsedUniform(pad.mesh, 1);
+    playPlayerJumpAnimation();
   }
 
   const powerHalfW = (LANE_WIDTH * 0.86) / 2;
