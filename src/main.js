@@ -2131,7 +2131,7 @@ function enhancePlayerGltfMaterials(root) {
         m.emissiveMap.needsUpdate = true;
       }
       if (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial) {
-        m.envMapIntensity = mobilePerf ? 0.72 : 1.35;
+        m.envMapIntensity = mobilePerf ? (isIPhoneOrIPod() ? 0.88 : 1.12) : 1.35;
         m.fog = false;
         if (m.map) {
           if (m.metalness >= 0.95) m.metalness = 0.08;
@@ -2695,17 +2695,32 @@ function makeTunnelStripe(z0, length) {
   const d = tunnelGeomConsts();
   const zc = z0 + length * 0.5;
 
-  const hj = (rng() - 0.5) * 0.028;
-  const hY = 0.14 + hj;
-  const coreL = new THREE.Color().setHSL(hY - 0.006, 0.9, 0.1);
-  const edgeL = new THREE.Color().setHSL(hY + 0.02, 0.94, 0.56);
-  const coreR = new THREE.Color().setHSL(hY + 0.008, 0.86, 0.11);
-  const edgeR = new THREE.Color().setHSL(hY - 0.01, 0.92, 0.57);
-  const coreC = new THREE.Color().setHSL(hY + 0.012, 0.84, 0.1);
-  const edgeC = new THREE.Color().setHSL(hY + 0.024, 0.91, 0.55);
-  const matL = makeTunnelNeonMaterial(coreL, edgeL, mobilePerf ? 0.25 : 0.26, 0.86, rng() * Math.PI * 2);
-  const matR = makeTunnelNeonMaterial(coreR, edgeR, mobilePerf ? 0.25 : 0.26, 0.84, rng() * Math.PI * 2);
-  const matC = makeTunnelNeonMaterial(coreC, edgeC, mobilePerf ? 0.23 : 0.24, 0.88, rng() * Math.PI * 2);
+  let matL;
+  let matR;
+  let matC;
+  /**
+   * Mobile: cheap `HOLO_BOX_FS` + fixed yellow (no magenta/cyan crossfade, no uPlayerZ / uRunLightEase
+   * per frame). Cuts shader cost + uniform writes vs `TUNNEL_NEON_FS`.
+   */
+  if (mobilePerf) {
+    const coreY = new THREE.Color().setHSL(0.125, 0.98, 0.5);
+    const edgeY = new THREE.Color().setHSL(0.14, 0.92, 0.74);
+    matL = makeHologramBoxMaterial(coreY, edgeY, 0.36, 0.95, rng() * Math.PI * 2);
+    matR = makeHologramBoxMaterial(coreY.clone(), edgeY.clone(), 0.36, 0.95, rng() * Math.PI * 2);
+    matC = makeHologramBoxMaterial(coreY.clone(), edgeY.clone(), 0.34, 0.95, rng() * Math.PI * 2);
+  } else {
+    const hj = (rng() - 0.5) * 0.028;
+    const hY = 0.14 + hj;
+    const coreL = new THREE.Color().setHSL(hY - 0.006, 0.9, 0.1);
+    const edgeL = new THREE.Color().setHSL(hY + 0.02, 0.94, 0.56);
+    const coreR = new THREE.Color().setHSL(hY + 0.008, 0.86, 0.11);
+    const edgeR = new THREE.Color().setHSL(hY - 0.01, 0.92, 0.57);
+    const coreC = new THREE.Color().setHSL(hY + 0.012, 0.84, 0.1);
+    const edgeC = new THREE.Color().setHSL(hY + 0.024, 0.91, 0.55);
+    matL = makeTunnelNeonMaterial(coreL, edgeL, 0.26, 0.86, rng() * Math.PI * 2);
+    matR = makeTunnelNeonMaterial(coreR, edgeR, 0.26, 0.84, rng() * Math.PI * 2);
+    matC = makeTunnelNeonMaterial(coreC, edgeC, 0.24, 0.88, rng() * Math.PI * 2);
+  }
 
   const left = new THREE.Mesh(new THREE.BoxGeometry(d.wallT, d.wallH, length), matL);
   left.position.set(-(d.innerHalf + d.wallT * 0.5), d.yWall, zc);
@@ -2728,8 +2743,8 @@ function makeTunnelStripe(z0, length) {
 
   slab.receiveShadow = !mobilePerf;
 
-  /** Avoid `worldGroup.traverse` every frame in `syncTunnelNeonUniforms` (Three.js perf: minimize traversals). */
-  g.userData.tunnelNeonMats = [matL, matR, matC];
+  /** Desktop: tunnel neon mats get uPlayerZ / uRunLightEase in `syncTunnelNeonUniforms`. */
+  g.userData.tunnelNeonMats = mobilePerf ? null : [matL, matR, matC];
 
   return g;
 }
@@ -2901,14 +2916,20 @@ function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, 
 
 function syncTunnelNeonUniforms(dt) {
   if (!worldGroup || !playerGroup || !gameStarted) return;
+  /** Mobile tunnels use static yellow holo; no inside/out floor pulse (saves uniform work + visual shift). */
+  if (mobilePerf) {
+    tunnelRunLightEase = 0;
+    if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
+      runwaySlabMat.uniforms.uTunnelFloorBright.value = 0;
+    }
+    return;
+  }
   const inside = getTunnelStripeAtDistanceForFrame() != null;
   const k = 1 - Math.exp(-dt * (inside ? 5.8 : 3.2));
   tunnelRunLightEase = THREE.MathUtils.lerp(tunnelRunLightEase, inside ? 1 : 0, k);
   if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
     runwaySlabMat.uniforms.uTunnelFloorBright.value = tunnelRunLightEase;
   }
-  /** Mobile: wall holo uniforms are many writes; slab brightness still updates above every frame. */
-  if (mobilePerf && (renderFrameIndex & 1) === 1) return;
   const pz = playerGroup.position.z;
   for (let i = 0; i < worldGroup.children.length; i++) {
     const mats = worldGroup.children[i].userData?.tunnelNeonMats;
@@ -3261,7 +3282,7 @@ function ensureRunwayExtendsTo(minZEnd) {
 
 function spawnChunk(endZ) {
   const z0 = endZ;
-  const tunnelP = TUNNEL_CHUNK_CHANCE * (mobilePerf ? 0.68 : 1);
+  const tunnelP = TUNNEL_CHUNK_CHANCE * (mobilePerf ? 0.48 : 1);
   if (rng() < tunnelP) {
     const tLen = TUNNEL_LENGTH_MIN + rng() * TUNNEL_LENGTH_RANGE;
     worldGroup.add(makeTunnelStripe(z0, tLen));
@@ -4056,7 +4077,7 @@ function init() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0c0822);
   if (mobilePerf) {
-    scene.fog = new THREE.Fog(0x281845, 28, 96);
+    scene.fog = new THREE.Fog(0x281845, 32, 102);
   } else {
     scene.fog = new THREE.Fog(0x281845, 32, 108);
   }
@@ -4081,7 +4102,7 @@ function init() {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   if (mobilePerf) {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.06;
+    renderer.toneMappingExposure = isIPhoneOrIPod() ? 1.14 : 1.22;
   } else {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.18;
@@ -4091,10 +4112,14 @@ function init() {
 
   setupImageBasedLighting();
 
-  const hemi = new THREE.HemisphereLight(0xfff0ff, 0x2a2248, mobilePerf ? 1.14 : 1.02);
+  const hemi = new THREE.HemisphereLight(
+    0xfff0ff,
+    0x2a2248,
+    mobilePerf ? (isIPhoneOrIPod() ? 1.28 : 1.22) : 1.02,
+  );
   hemiLightRef = hemi;
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffffff, mobilePerf ? 1.42 : 1.24);
+  const sun = new THREE.DirectionalLight(0xffffff, mobilePerf ? 1.55 : 1.24);
   sun.position.set(8, 18, 10);
   sun.castShadow = !mobilePerf;
   dirLightRef = sun;
@@ -4109,10 +4134,10 @@ function init() {
   }
   scene.add(sun);
   if (mobilePerf) {
-    const fill = new THREE.DirectionalLight(0xdde8ff, 0.48);
+    const fill = new THREE.DirectionalLight(0xe8f0ff, isIPhoneOrIPod() ? 0.58 : 0.52);
     fill.position.set(-16, 11, 6);
     scene.add(fill);
-    const rim = new THREE.DirectionalLight(0xffe0f5, 0.32);
+    const rim = new THREE.DirectionalLight(0xffe8f8, isIPhoneOrIPod() ? 0.42 : 0.38);
     rim.position.set(4, 7, -20);
     scene.add(rim);
   }
