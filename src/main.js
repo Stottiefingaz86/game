@@ -10,11 +10,81 @@ const canvas = document.querySelector('#c');
 function syncPlayCursor() {
   if (typeof document === 'undefined' || !document.body) return;
   const inActiveRun = gameStarted && alive && runGameplayActive;
+  const instrModal = document.getElementById('start-instructions-modal');
+  const instructionsOpen = instrModal != null && !instrModal.classList.contains('hidden');
   const menuCursor =
+    instructionsOpen ||
     (startScreenEl && !startScreenEl.classList.contains('hidden')) ||
     (overlay && !overlay.classList.contains('hidden'));
   document.body.classList.toggle('game-running', inActiveRun);
   document.body.classList.toggle('menu-cursor', menuCursor);
+}
+
+function closeStartInstructionsModal() {
+  startInstructionsModal?.classList.add('hidden');
+  startInstructionsModal?.setAttribute('aria-hidden', 'true');
+  syncPlayCursor();
+}
+
+function openStartInstructionsModal() {
+  startInstructionsModal?.classList.remove('hidden');
+  startInstructionsModal?.setAttribute('aria-hidden', 'false');
+  syncPlayCursor();
+  startInstructionsCloseBtn?.focus();
+}
+
+function hideStartScreenFully() {
+  closeStartInstructionsModal();
+  if (startScreenEl) {
+    startScreenEl.classList.add('hidden');
+    startScreenEl.classList.remove('start-screen--warming');
+    startScreenEl.classList.remove('start-screen--lobby');
+  }
+  startPanelLoadEl?.classList.remove('hidden');
+  startPanelWarmEl?.classList.add('hidden');
+  syncPlayCursor();
+}
+
+function showStartWarmPanel() {
+  startPanelLoadEl?.classList.add('hidden');
+  startPanelWarmEl?.classList.remove('hidden');
+  startScreenEl?.classList.add('start-screen--warming');
+  if (startWarmLineEl) {
+    startWarmLineEl.classList.remove('start-warm-line--pop');
+    void startWarmLineEl.offsetWidth;
+    startWarmLineEl.classList.add('start-warm-line--pop');
+  }
+  syncPlayCursor();
+}
+
+/**
+ * After graphics+audio load: if stretch already played in the lobby, go straight to run; else one-shot intro or run.
+ */
+function beginInitialIntroOrRun() {
+  stopLobbyRenderLoop();
+  clearLobbyBackdropDecor();
+  if (playerGroup) {
+    playerGroup.position.z = distance;
+    playerGroup.position.x = targetLaneX;
+  }
+  const hadLobbyStretch = lobbyStretchWasPlaying;
+  lobbyStretchWasPlaying = false;
+  stopLobbyStretchPresentation();
+  startScreenEl?.classList.remove('start-screen--lobby');
+
+  const clip = playerPendingStartClip;
+  playerPendingStartClip = null;
+
+  if (hadLobbyStretch) {
+    startRunAnimationImmediately();
+    return;
+  }
+  if (clip && playerMixer && playerRunAction) {
+    showStartWarmPanel();
+    setupPlayerStartIntro(clip);
+  } else {
+    startRunAnimationImmediately();
+  }
 }
 
 /** Resolves `public/` files on GitHub Pages and local dev (Vite `base: './'`). */
@@ -38,8 +108,15 @@ const overlayTitleEl = document.querySelector('.overlay-title');
 /** Monotonic token so stale game-over count-up animations do not write after restart. */
 let overlayAnimGeneration = 0;
 const startScreenEl = document.getElementById('start-screen');
+const startPanelLoadEl = document.getElementById('start-panel-load');
+const startPanelWarmEl = document.getElementById('start-panel-warm');
+const startWarmLineEl = document.getElementById('start-warm-line');
 const startBtnEl = document.getElementById('start-btn');
 const startStatusEl = document.getElementById('start-status');
+const startInstructionsBtn = document.getElementById('start-instructions-btn');
+const startInstructionsModal = document.getElementById('start-instructions-modal');
+const startInstructionsCloseBtn = document.getElementById('start-instructions-close');
+const startInstructionsDismissBtn = document.getElementById('start-instructions-dismiss');
 
 const LANE_WIDTH = 2.2;
 const LANES = [-1, 0, 1];
@@ -51,6 +128,15 @@ const TRACK_X_MAX = laneX(1) + LANE_WIDTH * 0.5;
 const GAP_WALL_DEPTH = 3.5;
 const GAP_WALL_Y = 0.75;
 const GAP_WALL_HALF_H = 0.675;
+/**
+ * Thin deck (was 0.35 m) so the near vertical face of the slab doesn’t fill the bottom of the lobby view.
+ * Top surface matches the old box: center −0.2 + half(0.35) = −0.025.
+ */
+const RUNWAY_SLAB_THICKNESS = 0.07;
+const RUNWAY_SLAB_TOP_Y = -0.025;
+const RUNWAY_SLAB_CENTER_Y = RUNWAY_SLAB_TOP_Y - RUNWAY_SLAB_THICKNESS * 0.5;
+/** Menu only: runner sits a few meters down +Z so feet read on the deck, not on the chunk seam at z=0. */
+const LOBBY_RUNNER_ANCHOR_Z = 2.55;
 
 /** 1 world unit along the track ≈ 1 m for HUD / score; `travelSpeed` ≈ m/s → km/h. */
 function travelSpeedToKph(travelSpeed) {
@@ -124,6 +210,18 @@ let scene, camera, renderer;
 let mobilePerf = false;
 /** True after `init()` completes (WebGL + scene). Used to avoid double init on retry. */
 let graphicsInited = false;
+/** Reused so Play + background lobby never double-load the player GLB. */
+let graphicsLoadPromise = null;
+/** True after first `preloadGraphicsPipeline` + lobby presentation. */
+let lobbyGraphicsReady = false;
+/** Visual-only obstacles + coins down the track on the menu (not in `obstacles` / `coins`). */
+let lobbyBackdropDecorGroup = null;
+/** User already saw looping stretch on the menu; skip the post-Play intro. */
+let lobbyStretchWasPlaying = false;
+/** Looping menu stretch clip (separate from one-shot `playerStartAction`). */
+let playerLobbyStretchAction = null;
+let lobbyLoopRafId = 0;
+let lobbyLastTime = 0;
 let playerGroup;
 /** GLTF run cycle; null while using block placeholder. */
 let playerMixer = null;
@@ -134,6 +232,8 @@ let playerJumpAnimOverride = false;
 let jumpAnimSetupGeneration = 0;
 let jumpAnimWatchdog = null;
 let playerStartAction = null;
+/** Resolved after GLB load; used on first Play to optionally run `setupPlayerStartIntro` before the run. */
+let playerPendingStartClip = null;
 /** World sim (movement, spawns) runs only after optional start intro clip finishes. */
 let runGameplayActive = true;
 let introSetupGeneration = 0;
@@ -165,15 +265,19 @@ const JUMP_GLTF_CANDIDATES = [
   'sounds/char/jump_animation.glb',
   'sounds/char/jumpAnimation.glb',
 ];
-/** Pre-run intro: prefer `stretch.glb`, then other start-style files. */
+/** Pre-run intro: prefer `start.glb`, then stretch / other motion files (retargeted onto the player rig). */
 const START_GLTF_CANDIDATES = [
-  'sounds/char/stretch.glb',
-  'sounds/char/Stretch.glb',
   'sounds/char/start.glb',
   'sounds/char/Start.glb',
+  'sounds/char/stretch.glb',
+  'sounds/char/Stretch.glb',
   'sounds/char/start_animation.glb',
   'sounds/char/start animation.glb',
 ];
+
+const CAMERA_FOV_GAMEPLAY = 58;
+/** Wider than before so the lower frame fills with deck (hides the near track edge above the UI bar). */
+const CAMERA_FOV_LOBBY = 52;
 /** First load wins; scaled to ~0.36 m for pickup. */
 const COIN_GLTF_CANDIDATES = [
   'sounds/char/coin.glb',
@@ -189,8 +293,11 @@ let coinPrefabIsSkinned = false;
  * Fine-tune after auto-orient (default faces down +Z, away from camera). Use ±Math.PI/2 if your GLB is sideways.
  */
 const PLAYER_MODEL_Y_ROTATION = 0;
+/** World Y rotation for running forward (+Z down the track, away from camera). */
+const PLAYER_RUN_FORWARD_Y = (3 * Math.PI) / 2 + PLAYER_MODEL_Y_ROTATION;
 /** Yaw added during start intro so the character faces the camera (run uses +Z away from cam). */
 const PLAYER_INTRO_FACE_CAMERA_YAW = Math.PI;
+const BACKWARD_YAW_LERP = 10;
 let worldGroup;
 let speed = 12;
 let baseSpeed = 12;
@@ -198,6 +305,8 @@ let baseSpeed = 12;
 const SPEED_RAMP_PER_UNIT = 0.022;
 const SPEED_MAX_BONUS = 36;
 let distance = 0;
+/** Farthest +Z progress this run; you can’t retreat more than `RUN_BACKWARD_MAX_METERS` below this (tap or hold). */
+let furthestDistance = 0;
 let coinCount = 0;
 let alive = true;
 /** False until Play preloads audio and unlocks the run (fixes prod / autoplay / stutter). */
@@ -221,34 +330,47 @@ const PLAYER_DUCK_TOP = 0.74;
 const DUCK_LERP_IN = 13;
 const DUCK_LERP_OUT = 1.55;
 /**
- * Rigged character: blend a slide/duck clip using `playerGroup.userData.duckAmount` (0–1) or
- * `playerGroup.userData.visualRoot.userData.duckBlend` (same value each frame while grounded).
+ * Down / S: run backward (distance −Z), face camera, reverse BGM; also drives duck hitbox when grounded.
+ * Max retreat: `distance` can’t go below `furthestDistance − RUN_BACKWARD_MAX_METERS` (hold, tap, or key repeat).
  */
-let duckHeld = false;
+let runBackwardHeld = false;
+/** Previous tick had Down/S held; used to skip one frame of forward slip after key-up while still behind peak. */
+let runBackwardPrevTick = false;
 let duckAmount = 0;
-/** Boost pad: higher launch than jump + brief forward surge. */
-const BOOST_PAD_VY = 27;
-const BOOST_SPEED_MULT = 1.45;
-const BOOST_SPEED_SEC = 1.05;
+/** Max meters behind `furthestDistance` (best forward progress this run). */
+const RUN_BACKWARD_MAX_METERS = 10;
+/**
+ * Boost pad: launch tuned so apex clears tunnel roof (`roofTopY` ~4.4–5.5 m; peak ≈ vy²/90 with GRAVITY -45).
+ * Forward surge stays on `BOOST_SPEED_MULT`, not height.
+ */
+const BOOST_PAD_VY = 24;
+const BOOST_SPEED_MULT = 2.72;
+const BOOST_SPEED_SEC = 1.5;
 /** Jump pad length along Z; keep collision `padHalfD` in sync. */
 const BOOST_PAD_DEPTH = 2.85;
 /** After a jump pad, base run speed bonus climbs faster for a few seconds. */
 const BOOST_PAD_ACCEL_SEC = 3.75;
 const BOOST_PAD_EXTRA_BONUS_RATE = 12;
 /** Ramps up along +Z (front lip); keep in sync with `makeCurvedJumpPadGeometry`. */
-const BOOST_PAD_MAX_LIFT = 0.34;
+const BOOST_PAD_MAX_LIFT = 0.27;
 
 /** Ground speed-only pad (red / pink); long strip like Wipeout — keep `powerHalfD` in sync. */
 const POWER_PAD_DEPTH = 7.2;
-const POWER_SPEED_MULT = 1.28;
-const POWER_SPEED_SEC = 1.45;
+const POWER_SPEED_MULT = 1.92;
+const POWER_SPEED_SEC = 1.85;
 
 const obstacles = [];
 const coins = [];
+/** Open-track purple coins sit above normal coin height; need a jump to overlap vertically. */
+const PURPLE_JUMP_COIN_Y = 1.9;
+const PURPLE_JUMP_COIN_Y_JITTER = 0.11;
+const PURPLE_JUMP_COIN_HIT_R = 0.33;
 const boostPads = [];
 const powerPads = [];
 /** Global time for hologram / boost shader animation (synced in render loop). */
 let holoTime = 0;
+/** 0→1 while inside a tunnel: drives localized brightness around the runner on tunnel walls. */
+let tunnelRunLightEase = 0;
 let speedBoostRemain = 0;
 /** Jump-pad: temporary faster climb toward `SPEED_MAX_BONUS`. */
 let boostRampRemain = 0;
@@ -321,7 +443,11 @@ let musicGridCeilingMaterial = null;
 let musicPulseTime = 0;
 /** Single shader slab: soft neon lanes + rails (no mesh seams); colors track sky; foot/jump pulse. */
 let runwaySlabMat = null;
+/** Pre-spawn runway +Z so menu / wide FOV never shows an abrupt mesh end (tick does not run before Play). */
+const RUNWAY_TAIL_TARGET_Z = 340;
 let runwayLanePulse = 0;
+/** Smoothed value for runway `uPulse` (menu breathing + gameplay BGM) so the deck doesn’t strobe. */
+let runwaySlabPulseEased = 0;
 /** Fast decaying flash when feet hit the deck (slab shader; linear 0–1, shader squares for tight core). */
 let runwayFootFlash = 0;
 /** Footstep rhythm while grounded (sine zero-cross → pulse under player). */
@@ -332,6 +458,10 @@ let skipNextFootstepDetect = false;
 /** Decaying landing punch for subtle camera shake (jump land). */
 let landShakeMag = 0;
 let landShakePhase = 0;
+/** Gameplay camera before shake; lerped here so shake doesn’t drift into follow, and so we can decay after game over. */
+const cameraGameplayBasePos = new THREE.Vector3();
+/** Obstacle hit uses stronger shake than landing (`landShakeMag` is shared). */
+const OBSTACLE_HIT_SHAKE_MAG = 1.62;
 /** Eased camera height; tracks vertical jump. */
 let cameraSmoothedY = 4.2;
 const CAM_Y_AT_REST = 4.2;
@@ -351,6 +481,16 @@ const BGM_VOLUME = 0.38;
 const BGM_RATE_MIN = 1;
 /** Max BGM speed-up; tied to the same 0..1 ramp as travel speed (not boost pads). */
 const BGM_RATE_MAX = 1.32;
+/**
+ * True reverse isn’t reliable on `<audio>` across browsers; while running backward we use a very
+ * slow forward tempo instead (still “off” vs normal run).
+ */
+const BGM_BACKWARD_TEMPO_MUL = 0.27;
+const BGM_BACKWARD_TEMPO_MIN = 0.2;
+const BGM_BACKWARD_TEMPO_MAX = 0.4;
+const RUN_BACKWARD_TEMPO_MUL = 0.3;
+const RUN_BACKWARD_TEMPO_MIN = 0.22;
+const RUN_BACKWARD_TEMPO_MAX = 0.52;
 /** BGM lowpass when outside tunnels (Hz); inside tunnels lerps toward `BGM_TUNNEL_MUFFLE_HZ`. */
 const BGM_OPEN_LOWPASS_HZ = 16000;
 const BGM_TUNNEL_MUFFLE_HZ = 620;
@@ -376,10 +516,14 @@ function makeRunwaySlabShaderMaterial() {
       uVoid: { value: new THREE.Color(0x030009) },
       uEnvMap: { value: null },
       uCamPos: { value: new THREE.Vector3() },
-      uEnvIntensity: { value: 1.32 },
+      uEnvIntensity: { value: 1.58 },
       uFootFlash: { value: 0 },
       uPlayerX: { value: 0 },
       uPlayerZ: { value: 0 },
+      uFogNear: { value: 32 },
+      uFogFar: { value: 108 },
+      uFogColor: { value: new THREE.Color(0x281845) },
+      uTunnelFloorBright: { value: 0 },
     },
     fog: false,
     transparent: false,
@@ -414,8 +558,13 @@ function makeRunwaySlabShaderMaterial() {
       uniform float uFootFlash;
       uniform float uPlayerX;
       uniform float uPlayerZ;
+      uniform float uFogNear;
+      uniform float uFogFar;
+      uniform vec3 uFogColor;
+      uniform float uTunnelFloorBright;
 
       void main() {
+        float tun = clamp(uTunnelFloorBright, 0.0, 1.0);
         float ax = abs(vWPos.x);
         float z = vWPos.z + uScroll;
 
@@ -430,18 +579,23 @@ function makeRunwaySlabShaderMaterial() {
         wL /= ws;
         wC /= ws;
         wR /= ws;
-        vec3 laneNeon = uCyan * (wL * 0.52 + wC * 0.78) + uMagenta * (wR * 0.58);
+        vec3 lanePink = uMagenta * 1.12 + vec3(0.06, -0.02, 0.04);
+        vec3 laneNeon =
+          uCyan * (wL * 0.18 + wC * 0.18 + wR * 0.18) + lanePink * (wL * 0.92 + wC * 1.12 + wR * 0.92);
 
         float mist = 0.5 + 0.5 * sin(z * 0.07 + uTime * 0.9 + vWPos.x * 0.12);
-        vec3 haze = mix(uMagenta * 0.14, uCyan * 0.16, mist);
+        vec3 haze = mix(uMagenta * 0.2, uCyan * 0.22, mist);
 
         float depth = smoothstep(100.0, -15.0, vWPos.z);
-        float beat = 0.3 + uPulse * 0.24;
+        float beat = 0.34 + uPulse * 0.3;
         float intf = sin(z * 0.32 + uTime * 2.0) * sin(ax * 2.0 - uTime * 1.55) * 0.5 + 0.5;
         float scanY = sin(vWPos.y * 16.0 - uTime * 4.0) * 0.5 + 0.5;
         float scanXZ = sin(dot(vWPos.xz, vec2(6.8, 4.9)) + uTime * 3.2) * 0.5 + 0.5;
         float holoScan = scanY * 0.52 + scanXZ * 0.48;
-        laneNeon *= 0.9 + intf * 0.16 * (1.0 + uPulse * 0.85);
+        laneNeon *= 0.92 + intf * 0.2 * (1.0 + uPulse * 0.58);
+        float deckGrid = sin(z * 1.85 + uTime * 1.15) * sin(ax * 5.2 - uTime * 0.85);
+        deckGrid = pow(abs(deckGrid) * 0.5 + 0.5, 4.2);
+        laneNeon += lanePink * deckGrid * 0.1 * (0.55 + uPulse * 0.45);
 
         // Side rails: gradient magenta (inboard) → cyan tint → soft void (outboard), like a light tube.
         float railWide =
@@ -451,57 +605,71 @@ function makeRunwaySlabShaderMaterial() {
         float rIn = uLaneW * 1.415;
         float rOut = uLaneW * 1.68;
         float tRail = clamp((ax - rIn) / max(rOut - rIn, 0.001), 0.0, 1.0);
-        vec3 railInn = uMagenta * 0.62;
-        vec3 railMid = mix(uMagenta, uCyan, 0.42) * 0.48;
-        vec3 railOut = mix(uVoid.rgb * 0.42, uMagenta * 0.1, 0.55);
+        vec3 railInn = uMagenta * 0.78;
+        vec3 railMid = mix(uMagenta, uCyan, 0.42) * 0.58;
+        vec3 railOut = mix(uVoid.rgb * 0.38, uMagenta * 0.14, 0.55);
         vec3 railGradCol = mix(mix(railInn, railMid, smoothstep(0.0, 0.5, tRail)), railOut, smoothstep(0.38, 1.0, tRail));
-        vec3 railGlow = railGradCol * (railWide * 0.32 + railCore * 0.72) * (0.58 + uPulse * 0.1);
+        vec3 railGlow = railGradCol * (railWide * 0.38 + railCore * 0.82) * (0.66 + uPulse * 0.12);
         float railOuter =
           smoothstep(uLaneW * 1.72, uLaneW * 1.82, ax) * (1.0 - smoothstep(uLaneW * 1.96, uLaneW * 2.12, ax));
-        vec3 railHalo = mix(uMagenta, uCyan, 0.35) * railOuter * (0.05 + uPulse * 0.03 + beat * 0.025);
+        vec3 railHalo = mix(uMagenta, uCyan, 0.35) * railOuter * (0.07 + uPulse * 0.045 + beat * 0.034);
 
-        vec3 base = uVoid.rgb * 1.05 + vec3(0.028, 0.022, 0.048);
-        vec3 underGlow = laneNeon * beat * (0.22 + depth * 0.16);
-        underGlow += haze * beat * 0.2 * (1.0 - railWide * 0.85);
-        vec3 holoTint = mix(uCyan * 0.42, uMagenta * 0.38, 0.5);
-        underGlow += holoTint * (0.1 + uPulse * 0.12) * (0.38 + holoScan * 0.62);
+        vec3 base = uVoid.rgb * (1.14 + tun * 0.55) + vec3(0.042, 0.036, 0.072) * (1.0 + tun * 1.05);
+        vec3 underGlow = laneNeon * beat * (0.32 + depth * 0.24);
+        underGlow += haze * beat * 0.28 * (1.0 - railWide * 0.85);
+        float laneEdge = exp(-pow(min(abs(vWPos.x + uLaneW), min(abs(vWPos.x), abs(vWPos.x - uLaneW))), 2.0) / (uLaneW * uLaneW * 0.11));
+        underGlow += lanePink * laneEdge * 0.14 * (0.5 + beat * 0.5);
+        vec3 holoTint = mix(uCyan * 0.52, uMagenta * 0.48, 0.5);
+        underGlow += holoTint * (0.14 + uPulse * 0.16) * (0.42 + holoScan * 0.68);
         underGlow += railGlow;
         underGlow += railHalo;
-        float corridorAura = exp(-ax * ax / (uLaneW * uLaneW * 3.6)) * (0.1 + beat * 0.055 + uPulse * 0.04);
-        underGlow += mix(uCyan * 0.45, uMagenta * 0.38, 0.5) * corridorAura * (1.0 - railCore * 0.7);
+        float corridorAura = exp(-ax * ax / (uLaneW * uLaneW * 3.6)) * (0.13 + beat * 0.07 + uPulse * 0.055);
+        underGlow += mix(uCyan * 0.55, uMagenta * 0.48, 0.5) * corridorAura * (1.0 - railCore * 0.7);
+        underGlow *= 1.0 + tun * 0.85;
 
         vec3 N = normalize(vWorldNormal);
         vec3 V = normalize(uCamPos - vWPos);
         float ndv = clamp(dot(N, V), 0.0, 1.0);
-        float fresnel = pow(1.0 - ndv, 4.5) * 0.65 + 0.04;
-        float haloRim = pow(1.0 - ndv, 2.15) * (0.38 + beat * 0.12);
-        vec3 haloTint = mix(uCyan * 0.6, uMagenta * 0.55, 0.48 + uPulse * 0.18);
+        float fresnel = pow(1.0 - ndv, 4.2) * 0.78 + 0.06;
+        float haloRim = pow(1.0 - ndv, 2.05) * (0.46 + beat * 0.16);
+        vec3 haloTint = mix(uCyan * 0.72, uMagenta * 0.68, 0.48 + uPulse * 0.2);
         vec3 haloAdd = haloTint * haloRim * (1.0 - railCore * 0.22);
-        float holoFres = pow(1.0 - ndv, 2.85) * (0.2 + uPulse * 0.16 + holoScan * 0.08);
+        float holoFres = pow(1.0 - ndv, 2.65) * (0.26 + uPulse * 0.2 + holoScan * 0.1);
         haloAdd += mix(uCyan, uMagenta, 0.42) * holoFres;
         vec3 R = reflect(-V, N);
         R.xz *= vec2(1.0, 1.1);
         vec3 envCol = textureCube(uEnvMap, R).rgb;
-        vec3 reflection = envCol * uEnvIntensity * fresnel * (0.34 + beat * 0.14);
-        reflection += haloTint * fresnel * (0.15 + beat * 0.07);
+        vec3 reflection = envCol * uEnvIntensity * fresnel * (0.44 + beat * 0.2);
+        reflection += haloTint * fresnel * (0.2 + beat * 0.1);
+        reflection *= 1.0 + tun * 0.58;
 
-        vec3 jumpPulse = (uCyan * 0.42 + uMagenta * 0.48) * uImpact * 0.2;
+        vec3 jumpPulse = (uCyan * 0.42 + uMagenta * 0.48) * uImpact * 0.11;
 
         float fLin = clamp(uFootFlash, 0.0, 1.0);
-        float fCore = fLin * fLin;
+        float fSoft = pow(fLin, 0.72);
+        float fCore = fSoft * fSoft;
         float pd = length(vec2(vWPos.x - uPlayerX, vWPos.z - uPlayerZ));
         float footCore = fCore * exp(-pd * 0.48) * 0.82;
         float rippleOut = (1.0 - fLin) * 10.5;
         float footRing1 =
-          fLin * 0.52 * exp(-pow(pd - rippleOut * 0.52, 2.0) / (5.8 + rippleOut * 0.45));
+          fSoft * 0.38 * exp(-pow(pd - rippleOut * 0.52, 2.0) / (5.8 + rippleOut * 0.45));
         float footRing2 =
-          fLin * 0.34 * exp(-pow(pd - rippleOut * 0.95, 2.0) / (18.0 + rippleOut * 0.85));
+          fSoft * 0.26 * exp(-pow(pd - rippleOut * 0.95, 2.0) / (18.0 + rippleOut * 0.85));
         vec3 footCol = mix(uCyan, uMagenta, sin(pd * 0.5 - uTime * 5.5) * 0.5 + 0.5);
-        vec3 footAdd = footCol * (footCore * 0.72 + footRing1 + footRing2);
-        footAdd += (uCyan + uMagenta) * 0.042 * fLin * exp(-pd * 0.075);
+        vec3 footAdd = footCol * (footCore * 0.55 + footRing1 + footRing2);
+        footAdd += (uCyan + uMagenta) * 0.028 * fSoft * exp(-pd * 0.075);
 
         vec3 rgb = base + underGlow + haloAdd + reflection + jumpPulse + footAdd;
-        rgb = min(rgb, vec3(1.14));
+        vec3 tunPop =
+          vec3(1.0, 0.92, 0.5) * 0.45 + uMagenta * 0.38 + uCyan * 0.36 + vec3(0.72, 0.4, 1.0) * 0.28;
+        rgb += tunPop * tun * 0.14;
+        float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
+        rgb = mix(vec3(lum), rgb, 1.09);
+        rgb = min(rgb, vec3(1.28 + tun * 0.22));
+        float camDist = length(vWPos - uCamPos);
+        float fogT = smoothstep(uFogNear, uFogFar, camDist);
+        fogT *= mix(1.0, 0.45, tun);
+        rgb = mix(rgb, uFogColor, fogT * 0.94);
         gl_FragColor = vec4(rgb, 1.0);
       }
     `,
@@ -522,10 +690,10 @@ function bumpRunwayLanePulse(amount = 1) {
   runwayLanePulse = Math.min(1, runwayLanePulse + amount);
 }
 
-/** Landing / foot contact: bright ring on slab + lane color burst. */
+/** Landing / foot contact: soft ring on slab + lane pulse (scaled so it reads as pulse, not a camera flash). */
 function bumpRunwayFootImpact(strength = 1) {
-  runwayFootFlash = Math.min(1, runwayFootFlash + strength);
-  bumpRunwayLanePulse(0.5 * strength);
+  runwayFootFlash = Math.min(1, runwayFootFlash + strength * 0.52);
+  bumpRunwayLanePulse(0.32 * strength);
 }
 
 /** After a normal jump, play land once when feet touch the ground. */
@@ -671,7 +839,11 @@ function playGameOverSfx() {
   playOneShotFromCache('gameover', 0.62);
 }
 
-function updateRunSfx() {
+function isRunningBackward() {
+  return runBackwardHeld && alive && runGameplayActive;
+}
+
+function updateRunSfx(dt) {
   if (!gameStarted || !runGameplayActive || !runAudio || !bgmUnlocked) return;
   if (!alive) {
     if (!runAudio.paused) runAudio.pause();
@@ -686,11 +858,21 @@ function updateRunSfx() {
   const grounded = playerY < 0.02 || onTunnelRoof;
   if (grounded) {
     if (runAudio.paused) runAudio.play().catch(() => {});
-    runAudio.playbackRate = THREE.MathUtils.clamp(
+    const rate = THREE.MathUtils.clamp(
       0.92 + difficultyRampT * 0.42 + (powerSpeedRemain > 0 ? 0.14 : 0),
       0.75,
       1.65,
     );
+    if (isRunningBackward()) {
+      if (runAudio.paused) runAudio.play().catch(() => {});
+      runAudio.playbackRate = THREE.MathUtils.clamp(
+        rate * RUN_BACKWARD_TEMPO_MUL,
+        RUN_BACKWARD_TEMPO_MIN,
+        RUN_BACKWARD_TEMPO_MAX,
+      );
+    } else {
+      runAudio.playbackRate = rate;
+    }
   } else if (!runAudio.paused) {
     runAudio.pause();
   }
@@ -753,8 +935,22 @@ function updateBgmPlayback(dt) {
     bgmIntroFadeActive = false;
     bgmAudio.volume = BGM_VOLUME;
   }
-  const targetRate = BGM_RATE_MIN + difficultyRampT * (BGM_RATE_MAX - BGM_RATE_MIN);
-  bgmAudio.playbackRate = THREE.MathUtils.clamp(targetRate, 0.85, 2);
+  const targetRate = THREE.MathUtils.clamp(
+    BGM_RATE_MIN + difficultyRampT * (BGM_RATE_MAX - BGM_RATE_MIN),
+    0.85,
+    2,
+  );
+  if (isRunningBackward()) {
+    if (bgmAudio.paused) void bgmAudio.play().catch(() => {});
+    bgmAudio.playbackRate = THREE.MathUtils.clamp(
+      targetRate * BGM_BACKWARD_TEMPO_MUL,
+      BGM_BACKWARD_TEMPO_MIN,
+      BGM_BACKWARD_TEMPO_MAX,
+    );
+    syncBgmPlayState();
+    return;
+  }
+  bgmAudio.playbackRate = targetRate;
   syncBgmPlayState();
 }
 
@@ -860,6 +1056,7 @@ function resolveBlenderNlaStyleClips(animations) {
   }
   if (pool.length === 3) {
     return {
+      start: sorted[0],
       run: sorted[2],
       jump: sorted[1],
     };
@@ -867,6 +1064,7 @@ function resolveBlenderNlaStyleClips(animations) {
   const runIdx = sorted.length - 1;
   const jumpIdx = Math.max(1, sorted.length - 2);
   return {
+    start: sorted[0],
     run: sorted[runIdx],
     jump: sorted[jumpIdx],
   };
@@ -884,10 +1082,12 @@ function resolveThreeClipDurationPack(animations) {
   const pool = animations.filter((_, i) => !isBindOrPoseClipName(lower[i]));
   if (pool.length < 3) return null;
   const sorted = [...pool].sort((a, b) => (b.duration || 0) - (a.duration || 0));
+  const start = sorted[0];
   const run = sorted[sorted.length - 1];
   const jump = sorted[sorted.length - 2];
   if (!run || !jump || run === jump) return null;
-  return { run, jump };
+  if (start === run || start === jump) return null;
+  return { start, run, jump };
 }
 
 function pickRunAnimationClip(clips) {
@@ -969,11 +1169,13 @@ function pickFallthroughJumpClip(clips, runClip, alsoExclude = null) {
 }
 
 /** Start only when the name hints intro; never guess from a lone extra clip (avoids using jump as intro). */
-function pickFallthroughStartClip(clips, runClip) {
+function pickFallthroughStartClip(clips, runClip, excludeJumpClip = null) {
   if (!clips?.length || !runClip) return null;
   const lower = clips.map((c) => c.name.toLowerCase());
   const pool = clips.filter((_, i) => !isBindOrPoseClipName(lower[i]));
-  const others = pool.filter((c) => c !== runClip);
+  const others = pool.filter(
+    (c) => c !== runClip && (!excludeJumpClip || c !== excludeJumpClip),
+  );
   for (const c of others) {
     if (/stretch|start|intro|ready|countdown|\bcount\b|mark/i.test(c.name)) return c;
   }
@@ -988,7 +1190,7 @@ function isUsableAnimClip(c) {
  * Start / intro clip. `excludeClip` is the run clip so we never use one animation for both
  * (e.g. "intro run"). Single-clip fallback only if that clip is not the run clip.
  */
-function pickStartAnimationClip(clips, excludeClip = null) {
+function pickStartAnimationClip(clips, excludeClip = null, excludeJumpClip = null) {
   if (!clips?.length) return null;
   const lower = clips.map((c) => c.name.toLowerCase());
   const candidates = clips.filter((_, i) => !isBindOrPoseClipName(lower[i]));
@@ -998,11 +1200,30 @@ function pickStartAnimationClip(clips, excludeClip = null) {
   for (const k of keys) {
     for (let i = 0; i < pool.length; i++) {
       if (excludeClip && pool[i] === excludeClip) continue;
+      if (excludeJumpClip && pool[i] === excludeJumpClip) continue;
       if (poolLower[i].includes(k)) return pool[i];
     }
   }
-  if (pool.length === 1 && pool[0] !== excludeClip) return pool[0];
+  if (
+    pool.length === 1 &&
+    pool[0] !== excludeClip &&
+    pool[0] !== excludeJumpClip
+  ) {
+    return pool[0];
+  }
   return null;
+}
+
+/** Remaining motion after run+jump (e.g. Tripo longest track) when it has no "start" in the name. */
+function pickLongestNonRunJumpMotionClip(animations, runClip, jumpClip) {
+  if (!animations?.length || !runClip) return null;
+  const exclude = new Set([runClip, jumpClip].filter(Boolean));
+  const lower = animations.map((c) => c.name.toLowerCase());
+  const pool = animations.filter((c, i) => !isBindOrPoseClipName(lower[i]) && !exclude.has(c));
+  if (!pool.length) return null;
+  const sorted = [...pool].sort((a, b) => (b.duration || 0) - (a.duration || 0));
+  const best = sorted[0];
+  return isUsableAnimClip(best) ? best : null;
 }
 
 function removePlayerStartIntroListener() {
@@ -1064,7 +1285,128 @@ function updateIntroCamera() {
   camera.lookAt(playerGroup.position.x * (0.42 + closeAmt * 0.12), lookY, lookAhead);
 }
 
+const lobbyLookTarget = new THREE.Vector3();
+
+/**
+ * Menu camera: look at the runner’s chest — not far down the track (gameplay lookAhead hid the character).
+ */
+function applyLobbyCameraPose() {
+  if (!camera || !playerGroup) return;
+  if (camera.fov !== CAMERA_FOV_LOBBY) {
+    camera.fov = CAMERA_FOV_LOBBY;
+    camera.updateProjectionMatrix();
+  }
+  const px = playerGroup.position.x;
+  const pz = playerGroup.position.z;
+  const py = playerGroup.position.y + playerY;
+  /** Farther back than before so the runner isn’t huge in frame; look target keeps them centered. */
+  const backDist = 3.12;
+  const side = 0.2;
+  const camH = 1.22;
+  camera.position.set(px + side, py + camH, pz - backDist);
+  lobbyLookTarget.set(px, py + 1.0, pz + 2.55);
+  camera.lookAt(lobbyLookTarget);
+}
+
+function stopLobbyStretchPresentation() {
+  if (playerLobbyStretchAction) {
+    playerLobbyStretchAction.stop();
+    playerLobbyStretchAction.setEffectiveWeight(0);
+    playerLobbyStretchAction = null;
+  }
+}
+
+/**
+ * Menu backdrop: face camera + loop stretch/start clip; static block runner gets camera only.
+ */
+function startLobbyStretchPresentation() {
+  if (!graphicsInited || gameStarted) return;
+  stopLobbyStretchPresentation();
+  const vr = playerGroup?.userData?.visualRoot;
+  if (vr) {
+    applyIntroFacingTowardCamera();
+  } else if (playerGroup) {
+    /** Block runner faces +Z by default; camera sits at −Z and would see a paper-thin edge. */
+    playerGroup.rotation.y = Math.PI;
+  }
+  const clip = playerPendingStartClip;
+  if (clip && playerMixer && playerRunAction && isUsableAnimClip(clip) && clip !== playerRunAction.getClip()) {
+    playerRunAction.setEffectiveWeight(0);
+    playerRunAction.paused = true;
+    playerLobbyStretchAction = playerMixer.clipAction(clip);
+    playerLobbyStretchAction.setLoop(THREE.LoopRepeat, Infinity);
+    playerLobbyStretchAction.clampWhenFinished = false;
+    playerLobbyStretchAction.enabled = true;
+    playerLobbyStretchAction.reset();
+    playerLobbyStretchAction.setEffectiveWeight(1);
+    playerLobbyStretchAction.play();
+    lobbyStretchWasPlaying = true;
+  } else {
+    lobbyStretchWasPlaying = false;
+  }
+  if (playerGroup) playerGroup.position.z = LOBBY_RUNNER_ANCHOR_Z;
+  applyLobbyCameraPose();
+  lobbyGraphicsReady = true;
+  startScreenEl?.classList.add('start-screen--lobby');
+  buildLobbyBackdropDecor();
+  syncPlayCursor();
+}
+
+function stopLobbyRenderLoop() {
+  if (lobbyLoopRafId) {
+    cancelAnimationFrame(lobbyLoopRafId);
+    lobbyLoopRafId = 0;
+  }
+}
+
+function lobbyLoop(now) {
+  if (gameStarted) return;
+  if (!graphicsInited || !renderer || !scene || !camera) {
+    lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
+    return;
+  }
+  const dt = lobbyLastTime ? Math.min(0.05, (now - lobbyLastTime) / 1000) : 0.016;
+  lobbyLastTime = now;
+  holoTime += dt;
+  ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
+  if (playerGroup) playerGroup.position.z = LOBBY_RUNNER_ANCHOR_Z;
+  applyLobbyCameraPose();
+  if (playerMixer) playerMixer.update(dt);
+  if (lobbyBackdropDecorGroup) {
+    lobbyBackdropDecorGroup.traverse((o) => {
+      if (o.userData?.lobbySpinCoin) o.rotation.y += dt * 3.1;
+    });
+  }
+  updateMusicReactiveVisuals(dt);
+  syncHologramTimeUniforms(holoTime);
+  renderer.render(scene, camera);
+  lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
+}
+
+function startLobbyRenderLoop() {
+  stopLobbyRenderLoop();
+  lobbyLastTime = performance.now();
+  lobbyLoopRafId = requestAnimationFrame(lobbyLoop);
+}
+
+async function bootstrapLobbyGraphics() {
+  try {
+    await preloadGraphicsPipeline();
+    if (gameStarted) return;
+    startLobbyStretchPresentation();
+    startLobbyRenderLoop();
+  } catch (err) {
+    console.error('AstroRun: lobby 3D failed to load', err);
+  }
+}
+
 function startRunAnimationImmediately() {
+  hideStartScreenFully();
+  runwaySlabPulseEased = 0;
+  if (camera && camera.fov !== CAMERA_FOV_GAMEPLAY) {
+    camera.fov = CAMERA_FOV_GAMEPLAY;
+    camera.updateProjectionMatrix();
+  }
   if (introCameraActive) {
     cameraSmoothedY = camera.position.y;
   }
@@ -1074,6 +1416,9 @@ function startRunAnimationImmediately() {
   bgmIntroFadeActive = false;
   if (bgmAudio) bgmAudio.volume = BGM_VOLUME;
   restoreRunFacingAfterIntro();
+  if (playerGroup && !playerGroup.userData.visualRoot) {
+    playerGroup.rotation.y = 0;
+  }
   if (playerStartAction) {
     playerStartAction.stop();
     playerStartAction.setEffectiveWeight(0);
@@ -1113,6 +1458,10 @@ function setupPlayerStartIntro(startClip) {
   if (startClip === playerRunAction.getClip()) {
     startRunAnimationImmediately();
     return;
+  }
+  if (camera && camera.fov !== CAMERA_FOV_GAMEPLAY) {
+    camera.fov = CAMERA_FOV_GAMEPLAY;
+    camera.updateProjectionMatrix();
   }
   removePlayerStartIntroListener();
   if (playerStartAction) playerStartAction.stop();
@@ -1161,6 +1510,60 @@ async function tryLoadExternalStartClip() {
       let c = pickStartAnimationClip(sgltf.animations);
       if (!c) c = pickClipFromExternalMotionGltf(sgltf.animations);
       if (c && isUsableAnimClip(c)) return c;
+    } catch {
+      /* try next path */
+    }
+  }
+  return null;
+}
+
+/**
+ * Load `start.glb` (etc.) and retarget onto the **player** skinned mesh — same idea as `jump.glb`.
+ */
+async function tryLoadExternalStartClipForPlayer(playerRoot) {
+  const targetMesh = getFirstSkinnedMesh(playerRoot);
+  if (!targetMesh?.skeleton) return null;
+
+  const loader = new GLTFLoader();
+  for (const rel of START_GLTF_CANDIDATES) {
+    try {
+      const sgltf = await loader.loadAsync(publicAsset(rel));
+      let c = pickStartAnimationClip(sgltf.animations);
+      if (!c) c = pickClipFromExternalMotionGltf(sgltf.animations);
+      if (!c || !isUsableAnimClip(c)) continue;
+
+      let srcHasSkinned = false;
+      sgltf.scene.traverse((o) => {
+        if (o.isSkinnedMesh) srcHasSkinned = true;
+      });
+      const srcScene = srcHasSkinned ? cloneSkinnedModel(sgltf.scene) : sgltf.scene.clone(true);
+      const sourceMesh = getFirstSkinnedMesh(srcScene);
+      if (!sourceMesh?.skeleton) {
+        disposeObjectSubtree(srcScene);
+        continue;
+      }
+
+      let retargeted;
+      try {
+        retargeted = retargetClip(targetMesh, sourceMesh, c, {
+          hip: guessHipBoneName(targetMesh.skeleton),
+          useFirstFramePosition: true,
+        });
+      } catch (err) {
+        console.warn(`[AstroRun] start/stretch retarget failed (${rel}):`, err);
+        disposeObjectSubtree(srcScene);
+        continue;
+      }
+
+      disposeObjectSubtree(srcScene);
+
+      if (!retargeted?.tracks?.length) continue;
+
+      const prefixed = prefixRetargetedClipForSkinnedMesh(retargeted, targetMesh);
+      if (prefixed.tracks.length && isUsableAnimClip(prefixed)) {
+        prefixed.name = c.name || prefixed.name || 'startRetargeted';
+        return prefixed;
+      }
     } catch {
       /* try next path */
     }
@@ -1261,7 +1664,7 @@ async function tryLoadExternalJumpClip(playerRoot) {
           useFirstFramePosition: true,
         });
       } catch (err) {
-        console.warn(`[SubwayBlocks] jump retarget failed (${rel}):`, err);
+        console.warn(`[AstroRun] jump retarget failed (${rel}):`, err);
         disposeObjectSubtree(srcScene);
         continue;
       }
@@ -1512,6 +1915,7 @@ function applyPurpleTunnelCoinTint(root) {
 }
 
 function clearPlayerVisuals() {
+  stopLobbyStretchPresentation();
   removePlayerJumpFinishedListener();
   removePlayerStartIntroListener();
   restoreRunFacingAfterIntro();
@@ -1560,6 +1964,7 @@ async function loadAndApplyPlayerCharacter() {
     }
   }
   if (!gltf) {
+    playerPendingStartClip = null;
     console.warn('No player GLB found in', PLAYER_GLTF_CANDIDATES);
     if (playerGroup.children.length === 0) {
       const fb = makeBlockPlayer();
@@ -1582,8 +1987,7 @@ async function loadAndApplyPlayerCharacter() {
      * Run is +Z; camera sits at −Z. 3π/2 yaw faces the character down the track (away from camera).
      * (If your export differs, use PLAYER_MODEL_Y_ROTATION.)
      */
-    const autoYaw = (3 * Math.PI) / 2;
-    model.rotation.y = autoYaw + PLAYER_MODEL_Y_ROTATION;
+    model.rotation.y = PLAYER_RUN_FORWARD_Y;
     model.updateMatrixWorld(true);
 
     const box = new THREE.Box3().setFromObject(model);
@@ -1632,13 +2036,14 @@ async function loadAndApplyPlayerCharacter() {
       playerRunAction.setEffectiveWeight(0);
       playerGroup.userData.gltfStaticPose = false;
       if (nlaPack) {
+        const st = nlaPack.start?.name;
         console.info(
-          `Player loaded (${loadedPath}) — NLA mapping: run="${clip.name}" (${clip.duration?.toFixed?.(2) ?? '?'}s)`,
+          `Player loaded (${loadedPath}) — NLA/duration pack: run="${clip.name}" (${clip.duration?.toFixed?.(2) ?? '?'}s)${st ? ` | stretch/start="${st}"` : ''}`,
         );
       } else {
         console.info(`Player loaded (${loadedPath}) with animation: "${clip.name}"`);
       }
-      /** Run + jump only (no intro/stretch). Jump clip must be ready before gameplay `tick` runs. */
+      /** Run + jump + optional start clip (warm-up uses `setupPlayerStartIntro` after Play). */
       let jumpClipFinal = null;
       if (nlaPack?.jump && isUsableAnimClip(nlaPack.jump) && nlaPack.jump !== clip) {
         jumpClipFinal = nlaPack.jump;
@@ -1674,13 +2079,61 @@ async function loadAndApplyPlayerCharacter() {
       playerMixer.userData.playerJumpClipRef = jumpClipFinal || null;
       if (jumpClipFinal) setupPlayerJumpAction(jumpClipFinal);
 
-      startRunAnimationImmediately();
+      let startClipResolved = null;
+      if (
+        nlaPack?.start &&
+        isUsableAnimClip(nlaPack.start) &&
+        nlaPack.start !== clip &&
+        nlaPack.start !== jumpClipFinal
+      ) {
+        startClipResolved = nlaPack.start;
+      }
+      if (!startClipResolved) {
+        startClipResolved = pickStartAnimationClip(gltf.animations, clip, jumpClipFinal);
+        if (!isUsableAnimClip(startClipResolved) || startClipResolved === clip) {
+          startClipResolved = null;
+        }
+      }
+      if (!startClipResolved) {
+        startClipResolved = pickFallthroughStartClip(gltf.animations, clip, jumpClipFinal);
+      }
+      if (!startClipResolved) {
+        startClipResolved = pickLongestNonRunJumpMotionClip(
+          gltf.animations,
+          clip,
+          jumpClipFinal,
+        );
+      }
+      if (!startClipResolved || startClipResolved === clip) {
+        startClipResolved = await tryLoadExternalStartClipForPlayer(model);
+        if (!isUsableAnimClip(startClipResolved) || startClipResolved === clip) {
+          startClipResolved = null;
+        }
+      }
+      if (!startClipResolved) {
+        try {
+          const extStart = await tryLoadExternalStartClip();
+          if (isUsableAnimClip(extStart) && extStart !== clip) startClipResolved = extStart;
+        } catch {
+          /* optional external start */
+        }
+      }
+      playerPendingStartClip =
+        startClipResolved &&
+        isUsableAnimClip(startClipResolved) &&
+        startClipResolved !== clip &&
+        startClipResolved !== jumpClipFinal
+          ? startClipResolved
+          : null;
 
       const clipNames = gltf.animations.map((a) => a.name).join(', ');
+      const startLog =
+        playerPendingStartClip != null ? `"${playerPendingStartClip.name}"` : '—';
       console.info(
-        `[SubwayBlocks] clips: ${clipNames || '(none)'} | run: "${clip.name}" | jump: ${jumpClipFinal ? `"${jumpClipFinal.name}"` : '—'}`,
+        `[AstroRun] clips: ${clipNames || '(none)'} | run: "${clip.name}" | jump: ${jumpClipFinal ? `"${jumpClipFinal.name}"` : '—'} | start/lobby: ${startLog}`,
       );
     } else {
+      playerPendingStartClip = null;
       playerGroup.userData.gltfStaticPose = true;
       console.info(
         `Player mesh loaded (${loadedPath}) but this GLB has **no animation clips** (Tripo/static export). ` +
@@ -1688,6 +2141,7 @@ async function loadAndApplyPlayerCharacter() {
       );
     }
   } catch (err) {
+    playerPendingStartClip = null;
     console.warn('Player GLB failed after load, using block character:', err);
     if (playerGroup.children.length === 0) {
       const fb = makeBlockPlayer();
@@ -1735,10 +2189,10 @@ function makeGroundStripe(z0, length) {
   g.userData.zEnd = z0 + length;
 
   const slab = new THREE.Mesh(
-    new THREE.BoxGeometry(LANE_WIDTH * 3.6, 0.35, length),
+    new THREE.BoxGeometry(LANE_WIDTH * 3.6, RUNWAY_SLAB_THICKNESS, length),
     runwaySlabMat,
   );
-  slab.position.set(0, -0.2, z0 + length / 2);
+  slab.position.set(0, RUNWAY_SLAB_CENTER_Y, z0 + length / 2);
   g.add(slab);
 
   const rcv = !mobilePerf;
@@ -1751,8 +2205,8 @@ function makeGroundStripe(z0, length) {
 
 /** Chance each chunk is a long enclosed tunnel (walls + ceiling); rest stay open runway. */
 const TUNNEL_CHUNK_CHANCE = 0.29;
-const TUNNEL_LENGTH_MIN = 48;
-const TUNNEL_LENGTH_RANGE = 58;
+const TUNNEL_LENGTH_MIN = 22;
+const TUNNEL_LENGTH_RANGE = 26;
 
 /** Matches `makeTunnelStripe` mesh layout (used for roof / ceiling physics). */
 function tunnelGeomConsts() {
@@ -1836,34 +2290,26 @@ function makeTunnelStripe(z0, length) {
   g.userData.isTunnel = true;
 
   const slab = new THREE.Mesh(
-    new THREE.BoxGeometry(LANE_WIDTH * 3.6, 0.35, length),
+    new THREE.BoxGeometry(LANE_WIDTH * 3.6, RUNWAY_SLAB_THICKNESS, length),
     runwaySlabMat,
   );
-  slab.position.set(0, -0.2, z0 + length / 2);
+  slab.position.set(0, RUNWAY_SLAB_CENTER_Y, z0 + length / 2);
   g.add(slab);
 
   const d = tunnelGeomConsts();
   const zc = z0 + length * 0.5;
 
-  const Lc = 0.065 + rng() * 0.045;
-  const Le = 0.26 + rng() * 0.09;
-  const core = new THREE.Color().setHSL(0.59, 0.045, Lc);
-  const edge = new THREE.Color().setHSL(0.5, 0.11, Le);
-  const matL = makeHologramBoxMaterial(core, edge, 0.3, 0.9, rng() * Math.PI * 2);
-  const matR = makeHologramBoxMaterial(
-    core.clone().multiplyScalar(0.94),
-    edge.clone(),
-    0.3,
-    0.86,
-    rng() * Math.PI * 2,
-  );
-  const matC = makeHologramBoxMaterial(
-    core.clone().multiplyScalar(0.9),
-    edge,
-    0.24,
-    0.92,
-    rng() * Math.PI * 2,
-  );
+  const hj = (rng() - 0.5) * 0.028;
+  const hY = 0.14 + hj;
+  const coreL = new THREE.Color().setHSL(hY - 0.006, 0.9, 0.1);
+  const edgeL = new THREE.Color().setHSL(hY + 0.02, 0.94, 0.56);
+  const coreR = new THREE.Color().setHSL(hY + 0.008, 0.86, 0.11);
+  const edgeR = new THREE.Color().setHSL(hY - 0.01, 0.92, 0.57);
+  const coreC = new THREE.Color().setHSL(hY + 0.012, 0.84, 0.1);
+  const edgeC = new THREE.Color().setHSL(hY + 0.024, 0.91, 0.55);
+  const matL = makeTunnelNeonMaterial(coreL, edgeL, mobilePerf ? 0.22 : 0.26, 0.86, rng() * Math.PI * 2);
+  const matR = makeTunnelNeonMaterial(coreR, edgeR, mobilePerf ? 0.22 : 0.26, 0.84, rng() * Math.PI * 2);
+  const matC = makeTunnelNeonMaterial(coreC, edgeC, mobilePerf ? 0.2 : 0.24, 0.88, rng() * Math.PI * 2);
 
   const left = new THREE.Mesh(new THREE.BoxGeometry(d.wallT, d.wallH, length), matL);
   left.position.set(-(d.innerHalf + d.wallT * 0.5), d.yWall, zc);
@@ -1948,6 +2394,132 @@ const HOLO_BOX_FS = `
     gl_FragColor = vec4(col, alpha);
   }
 `;
+
+/**
+ * Outside: yellow-only hologram. Inside: two-tone (magenta–purple ↔ cyan), slow depth pulse + soft
+ * vertical bands — minimal pattern, no rainbow / busy interference.
+ */
+const TUNNEL_NEON_FS = `
+  uniform vec3 uCoreColor;
+  uniform vec3 uEdgeColor;
+  uniform float uAlpha;
+  uniform float uTime;
+  uniform float uHalo;
+  uniform float uPhase;
+  uniform float uPlayerZ;
+  uniform float uRunLightEase;
+  varying vec3 vNormal;
+  varying vec3 vViewDir;
+  varying vec3 vWorldPos;
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(vViewDir);
+    float ndv = abs(dot(N, V));
+    float fresnel = pow(1.0 - ndv, 2.85);
+
+    float tP = uTime + uPhase;
+    float zz = vWorldPos.z;
+    float wx = vWorldPos.x;
+    float wy = vWorldPos.y;
+
+    float scanV = sin(wy * 15.0 - tP * 5.15) * 0.5 + 0.5;
+    float scanH = sin(dot(vWorldPos.xz, vec2(6.4, 4.75)) + tP * 3.75) * 0.5 + 0.5;
+    float scan = scanV * 0.52 + scanH * 0.48;
+    float layerX = sin(wx * 3.05 + tP * 2.85) * sin(zz * 2.48 - tP * 2.12);
+    float layerY = sin(wy * 4.15 - tP * 3.35);
+    float phased = clamp(layerX * 0.55 + layerY * 0.4, -1.0, 1.0);
+    float planeSweep = sin(dot(vWorldPos, vec3(1.75, 1.05, 1.58)) + tP * 4.45) * 0.5 + 0.5;
+    float holoBeat = 0.78 + 0.22 * sin(tP * 2.65 + zz * 0.08);
+    float haloPulse = 0.74 + 0.26 * sin(tP * 3.05 + zz * 0.11);
+
+    float tripBlend = smoothstep(0.07, 0.9, uRunLightEase);
+
+    vec3 yCore = uCoreColor * (0.28 + scan * 0.52 + fresnel * 0.26);
+    yCore += uEdgeColor * (0.06 + abs(phased) * 0.14) * fresnel;
+    yCore += uCoreColor * planeSweep * 0.07;
+    vec3 yRim = uEdgeColor * fresnel * (1.02 + 0.48 * haloPulse) * uHalo;
+    yRim *= (1.0 + phased * 0.18 + (planeSweep - 0.5) * 0.12) * holoBeat;
+    vec3 yellowHolo = yCore + yRim;
+    yellowHolo *= 0.88 + 0.12 * sin(tP * 10.2 + wx * 3.4);
+
+    float depthPulse = 0.5 + 0.5 * sin(zz * 0.26 - tP * 1.85 + wy * 0.1);
+    float vBand = 0.5 + 0.5 * sin(wy * 3.25 - tP * 1.55 + zz * 0.04);
+    float pat = depthPulse * 0.78 + vBand * 0.22;
+
+    float duo = 0.5 + 0.5 * sin(zz * 0.12 - tP * 1.35 + wx * 0.18 + depthPulse * 0.35);
+    vec3 cInA = vec3(0.68, 0.2, 0.9);
+    vec3 cInB = vec3(0.18, 0.58, 0.92);
+    vec3 neonMix = mix(cInA, cInB, duo);
+
+    float inF = fresnel * 0.62;
+    vec3 nCore = neonMix * (0.26 + scan * 0.34 + inF * 0.2);
+    nCore += neonMix * abs(phased) * 0.048 * inF;
+    nCore *= 0.9 + 0.1 * pat;
+    vec3 nRim = neonMix * fresnel * (0.36 + 0.22 * haloPulse) * uHalo * 0.48;
+    nRim *= holoBeat * (1.0 + phased * 0.08);
+    vec3 insideHolo = nCore + nRim;
+    insideHolo *= 0.88 + 0.12 * planeSweep;
+    insideHolo += neonMix * (0.08 + 0.06 * depthPulse) * inF * vBand;
+
+    vec3 col = mix(yellowHolo, insideHolo, tripBlend);
+
+    float dz = zz - uPlayerZ;
+    float wake = exp(-(dz * dz) / (2.0 * 12.8 * 12.8));
+    float fore = smoothstep(-3.2, 0.6, dz) * (1.0 - smoothstep(10.5, 26.0, dz));
+    float runLit = 1.0 + uRunLightEase * (0.38 * wake + 0.12 * fore);
+    col *= runLit;
+    col = min(col, mix(vec3(1.12), vec3(1.06), tripBlend));
+
+    float alpha = uAlpha + fresnel * 0.5 * uHalo;
+    alpha += abs(phased) * 0.07 + scan * 0.065 + planeSweep * 0.045;
+    alpha += uRunLightEase * (wake * 0.06 + depthPulse * tripBlend * 0.05);
+    alpha = clamp(alpha, 0.18, 0.88);
+    gl_FragColor = vec4(col, alpha);
+  }
+`;
+
+function makeTunnelNeonMaterial(coreColor, edgeColor, alpha = 0.3, halo = 0.78, phase = 0) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uCoreColor: { value: coreColor.clone() },
+      uEdgeColor: { value: edgeColor.clone() },
+      uAlpha: { value: alpha },
+      uHalo: { value: halo },
+      uPhase: { value: phase },
+      uPlayerZ: { value: 0 },
+      uRunLightEase: { value: 0 },
+    },
+    vertexShader: HOLO_BOX_VS,
+    fragmentShader: TUNNEL_NEON_FS,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  mat.userData.tunnelNeon = true;
+  return mat;
+}
+
+function syncTunnelNeonUniforms(dt) {
+  if (!worldGroup || !playerGroup || !gameStarted) return;
+  const inside = getTunnelStripeAtZ(distance) != null;
+  const k = 1 - Math.exp(-dt * (inside ? 5.8 : 3.2));
+  tunnelRunLightEase = THREE.MathUtils.lerp(tunnelRunLightEase, inside ? 1 : 0, k);
+  if (runwaySlabMat?.uniforms?.uTunnelFloorBright) {
+    runwaySlabMat.uniforms.uTunnelFloorBright.value = tunnelRunLightEase;
+  }
+  const pz = playerGroup.position.z;
+  worldGroup.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const mat = obj.material;
+    const list = Array.isArray(mat) ? mat : [mat];
+    for (const m of list) {
+      if (!m?.uniforms?.uPlayerZ || !m.userData?.tunnelNeon) continue;
+      m.uniforms.uPlayerZ.value = pz;
+      m.uniforms.uRunLightEase.value = tunnelRunLightEase;
+    }
+  });
+}
 
 function makeHologramBoxMaterial(coreColor, edgeColor, alpha = 0.32, halo = 1, phase = 0) {
   return new THREE.ShaderMaterial({
@@ -2147,6 +2719,28 @@ function syncHologramTimeUniforms(t) {
   });
 }
 
+function getRunwayTailZEnd() {
+  if (!worldGroup?.children?.length) return 0;
+  let max = 0;
+  for (let i = 0; i < worldGroup.children.length; i++) {
+    const e = worldGroup.children[i].userData?.zEnd;
+    if (e != null && e > max) max = e;
+  }
+  return max;
+}
+
+/** Extend procedural runway toward +Z until at least `minZEnd` (menu has no `tick` chunk spawn). */
+function ensureRunwayExtendsTo(minZEnd) {
+  if (!worldGroup || minZEnd <= 0) return;
+  let guard = 0;
+  while (getRunwayTailZEnd() < minZEnd && guard < 40) {
+    const last = worldGroup.children[worldGroup.children.length - 1];
+    const lastEnd = last?.userData?.zEnd ?? getRunwayTailZEnd();
+    spawnChunk(lastEnd);
+    guard += 1;
+  }
+}
+
 function spawnChunk(endZ) {
   const z0 = endZ;
   if (rng() < TUNNEL_CHUNK_CHANCE) {
@@ -2157,6 +2751,104 @@ function spawnChunk(endZ) {
   const len = 24 + rng() * 16;
   worldGroup.add(makeGroundStripe(z0, len));
   return z0 + len;
+}
+
+function clearLobbyBackdropDecor() {
+  if (!lobbyBackdropDecorGroup) return;
+  if (scene) scene.remove(lobbyBackdropDecorGroup);
+  disposeObjectSubtree(lobbyBackdropDecorGroup);
+  lobbyBackdropDecorGroup = null;
+}
+
+/**
+ * Non-interactive trains, low blocks, and coin rows down +Z so the menu shows the same vocabulary as gameplay.
+ */
+function buildLobbyBackdropDecor() {
+  if (!scene || gameStarted || !graphicsInited) return;
+  clearLobbyBackdropDecor();
+  const tail = getRunwayTailZEnd();
+  const zMax = Math.min(tail - 6, 315);
+  if (zMax < 48) return;
+
+  const decorRng = mulberry32(0x10bbec01);
+  const rnd = () => decorRng();
+  const stepMin = mobilePerf ? 24 : 19;
+  const stepExtra = mobilePerf ? 16 : 20;
+
+  lobbyBackdropDecorGroup = new THREE.Group();
+  lobbyBackdropDecorGroup.name = 'lobbyBackdropDecor';
+
+  const addTrain = (z, lane) => {
+    const { core, edge } = sampleHazardHologramColors(rnd);
+    const mat = makeHologramBoxMaterial(core, edge, 0.34, 0.92, rnd() * Math.PI * 2);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.85, 1.35, 3.2), mat);
+    mesh.position.set(laneX(lane), 0.75, z);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    lobbyBackdropDecorGroup.add(mesh);
+  };
+
+  const addLow = (z, lane) => {
+    const { core, edge } = sampleHazardHologramColors(rnd);
+    const mat = makeHologramBoxMaterial(core, edge, 0.36, 0.9, rnd() * Math.PI * 2);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.75, 0.45, 0.55), mat);
+    mesh.position.set(laneX(lane), 0.22, z);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    lobbyBackdropDecorGroup.add(mesh);
+  };
+
+  const addCoinRow = (z0) => {
+    const lane = LANES[Math.floor(rnd() * 3)];
+    const n = mobilePerf ? 3 + Math.floor(rnd() * 2) : 3 + Math.floor(rnd() * 4);
+    for (let i = 0; i < n; i++) {
+      const visual = cloneCoinVisual();
+      visual.userData.lobbySpinCoin = true;
+      const zz = z0 + i * 1.1;
+      visual.position.set(laneX(lane), 0.55, zz);
+      if (visual.userData.isCoinGltf) {
+        visual.rotation.y = rnd() * Math.PI * 2;
+        visual.rotation.x = 0.52;
+        visual.rotation.z = rnd() * 0.28 - 0.14;
+      } else if (!visual.userData.isFallbackCoin) {
+        visual.rotation.y = rnd() * Math.PI * 2;
+      }
+      visual.traverse((o) => {
+        if (o.isMesh) {
+          o.castShadow = false;
+          o.receiveShadow = false;
+        }
+      });
+      lobbyBackdropDecorGroup.add(visual);
+    }
+  };
+
+  let z = 34 + rnd() * 12;
+  while (z < zMax - 14) {
+    const lane = LANES[Math.floor(rnd() * 3)];
+    if (rnd() < 0.46) addTrain(z, lane);
+    else addLow(z, lane);
+    if (rnd() < 0.86) addCoinRow(z + 2.5 + rnd() * 10);
+    z += stepMin + rnd() * stepExtra;
+  }
+
+  scene.add(lobbyBackdropDecorGroup);
+}
+
+/** Hittable obstacle holograms: deep red core + bright scarlet / magenta rim. */
+function sampleHazardHologramColors(rndFn = rng) {
+  const hBase = 0.955 + rndFn() * 0.045;
+  const core = new THREE.Color().setHSL(
+    hBase % 1,
+    0.78 + rndFn() * 0.18,
+    0.17 + rndFn() * 0.09,
+  );
+  const edge = new THREE.Color().setHSL(
+    (hBase + rndFn() * 0.035) % 1,
+    0.94 + rndFn() * 0.06,
+    0.44 + rndFn() * 0.16,
+  );
+  return { core, edge };
 }
 
 function minObstacleZSeparation(travelSpeed) {
@@ -2176,10 +2868,7 @@ function spawnObstacle(z, travelSpeed) {
 
   if (roll < 0.36) {
     kind = 'train';
-    const Lc = 0.09 + rng() * 0.05;
-    const Le = 0.34 + rng() * 0.1;
-    const core = new THREE.Color().setHSL(0.6, 0.03, Lc);
-    const edge = new THREE.Color().setHSL(0.58, 0.06, Le);
+    const { core, edge } = sampleHazardHologramColors();
     const mat = makeHologramBoxMaterial(core, edge, 0.34, 0.92, rng() * Math.PI * 2);
     mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.85, 1.35, 3.2), mat);
     mesh.position.set(laneX(lane), 0.75, z);
@@ -2194,10 +2883,7 @@ function spawnObstacle(z, travelSpeed) {
     lane = openLane;
     const g0 = laneX(openLane) - LANE_WIDTH * 0.5;
     const g1 = laneX(openLane) + LANE_WIDTH * 0.5;
-    const Lc = 0.1 + rng() * 0.04;
-    const Le = 0.36 + rng() * 0.09;
-    const core = new THREE.Color().setHSL(0.58, 0.05, Lc);
-    const edge = new THREE.Color().setHSL(0.52, 0.1, Le);
+    const { core, edge } = sampleHazardHologramColors();
     const mat = makeHologramBoxMaterial(core, edge, 0.35, 0.94, rng() * Math.PI * 2);
     mesh = new THREE.Group();
     mesh.position.set(0, 0, z);
@@ -2228,10 +2914,7 @@ function spawnObstacle(z, travelSpeed) {
     };
   } else {
     kind = 'low';
-    const Lc = 0.11 + rng() * 0.04;
-    const Le = 0.36 + rng() * 0.08;
-    const core = new THREE.Color().setHSL(0.62, 0.025, Lc);
-    const edge = new THREE.Color().setHSL(0.58, 0.05, Le);
+    const { core, edge } = sampleHazardHologramColors();
     const mat = makeHologramBoxMaterial(core, edge, 0.36, 0.9, rng() * Math.PI * 2);
     mesh = new THREE.Mesh(new THREE.BoxGeometry(LANE_WIDTH * 0.75, 0.45, 0.55), mat);
     mesh.position.set(laneX(lane), 0.22, z);
@@ -2272,6 +2955,43 @@ function spawnCoinRow(z) {
   }
   const rowEnd = z + (n - 1) * 1.1;
   if (zRangeOverlapsAnyTunnel(z - 1, rowEnd + 1)) spawnMegaRoofCoinsAlongRow(z, n, lane);
+  if (rng() < 0.48) spawnPurpleJumpCoinRow(z + 0.42, lane);
+}
+
+/**
+ * Purple coins over the track (not tunnel roof): high Y so standing collect fails; jump overlaps body band.
+ */
+function spawnPurpleJumpCoinRow(z, lane) {
+  const n = 2 + Math.floor(rng() * 4);
+  for (let i = 0; i < n; i++) {
+    const zz = z + i * 1.02;
+    const visual = cloneCoinVisual();
+    applyPurpleTunnelCoinTint(visual);
+    const cy =
+      PURPLE_JUMP_COIN_Y + (rng() - 0.5) * 2 * PURPLE_JUMP_COIN_Y_JITTER;
+    visual.position.set(laneX(lane), cy, zz);
+    visual.scale.multiplyScalar(1.32);
+    if (visual.userData.isCoinGltf) {
+      visual.rotation.y = rng() * Math.PI * 2;
+      visual.rotation.x = 0.52;
+      visual.rotation.z = rng() * 0.28 - 0.14;
+    } else if (!visual.userData.isFallbackCoin) {
+      visual.rotation.y = rng() * Math.PI * 2;
+    }
+    scene.add(visual);
+    coins.push({
+      mesh: visual,
+      z: zz,
+      lane,
+      collected: false,
+      collecting: false,
+      collectTime: 0,
+      baseScale: visual.scale.x,
+      pendingDispose: false,
+      jumpPurple: true,
+      coinValue: 2,
+    });
+  }
 }
 
 /**
@@ -2573,28 +3293,33 @@ function createMusicBackdrop() {
       uniform float uFlow;
       void main() {
         float h = vDir.y;
-        float horizon = pow(1.0 - abs(h), 5.5);
+        float horizon = pow(1.0 - abs(h), 4.65);
         float nearBand = pow(max(0.0, 1.0 - abs(h + 0.06)), 3.8);
         float ring = sin(length(vec2(vDir.x, vDir.z)) * 9.0 - uShimmer * 0.35) * 0.5 + 0.5;
         vec3 neon = mix(uMagenta, uCyan, sin(uShimmer * 0.05 + vDir.x * 2.0) * 0.5 + 0.5);
-        vec3 glow = neon * horizon * (0.48 + uPulse * 0.42 + uMid * 0.14);
+        vec3 glow = neon * horizon * (0.56 + uPulse * 0.48 + uMid * 0.17);
         float scan = sin(vDir.x * 12.0 + uShimmer * 0.4) * sin(vDir.z * 10.0 + uShimmer * 0.25);
-        glow += (uCyan + uMagenta) * 0.016 * scan * (0.28 + uPulse * 0.38) * (1.0 - abs(h));
+        glow += (uCyan + uMagenta) * 0.022 * scan * (0.28 + uPulse * 0.38) * (1.0 - abs(h));
         float saberVert = pow(abs(sin(vDir.x * 7.0 + uMid * 2.8)), 14.0);
-        glow += mix(uCyan, uMagenta, 0.45) * saberVert * uMid * 0.13 * nearBand * horizon;
+        glow += mix(uCyan, uMagenta, 0.45) * saberVert * uMid * 0.16 * nearBand * horizon;
         float sweep = sin(vDir.z * 11.0 - uShimmer * 0.1) * 0.5 + 0.5;
-        glow += neon * sweep * uPulse * 0.065 * nearBand;
+        glow += neon * sweep * uPulse * 0.078 * nearBand;
         float arcBeat = pow(abs(sin(atan(vDir.z, vDir.x) * 5.0 + uPulse * 2.5)), 6.0);
-        glow += (uCyan * 0.5 + uMagenta * 0.5) * arcBeat * uPulse * 0.052 * horizon;
-        glow += (uCyan + uMagenta) * 0.032 * uHigh * nearBand * ring;
+        glow += (uCyan * 0.5 + uMagenta * 0.5) * arcBeat * uPulse * 0.062 * horizon;
+        glow += (uCyan + uMagenta) * 0.04 * uHigh * nearBand * ring;
         float ribbon = pow(abs(sin(vDir.z * 17.0 + uFlow * 1.12 + uPulse * 2.0)), 5.0);
-        glow += neon * ribbon * 0.082 * horizon * (0.22 + uPulse * 0.45);
+        glow += neon * ribbon * 0.098 * horizon * (0.22 + uPulse * 0.45);
         float driftW = sin(vDir.y * 5.5 + uFlow * 0.11) * sin(vDir.x * 13.5 - uFlow * 0.085);
-        glow += (uCyan + uMagenta) * 0.024 * driftW * horizon * (0.22 + uMid * 0.38);
+        glow += (uCyan + uMagenta) * 0.032 * driftW * horizon * (0.22 + uMid * 0.38);
         float blob = sin(vDir.x * 9.0 + uFlow * 0.65) * sin(vDir.z * 8.0 - uFlow * 0.5);
-        glow += mix(uCyan, uMagenta, 0.5) * blob * 0.045 * (1.0 - abs(h)) * (0.12 + uHigh * 0.55);
+        glow += mix(uCyan, uMagenta, 0.5) * blob * 0.055 * (1.0 - abs(h)) * (0.12 + uHigh * 0.55);
         float slowRing = sin(length(vec2(vDir.x, vDir.z)) * 14.0 - uFlow * 0.45) * 0.5 + 0.5;
-        glow += neon * slowRing * 0.035 * uMid * (1.0 - abs(h));
+        glow += neon * slowRing * 0.044 * uMid * (1.0 - abs(h));
+        float neb =
+          sin(vDir.x * 3.8 + uFlow * 0.19) * sin(vDir.y * 3.2 + uFlow * 0.14) * sin(vDir.z * 4.6 - uFlow * 0.17);
+        glow += mix(uMagenta, uCyan, 0.52) * (0.5 + 0.5 * neb) * 0.068 * (1.0 - abs(h) * 0.85) * horizon;
+        float dust = pow(max(0.0, sin(vDir.x * 13.0 + uShimmer * 0.025) * 0.5 + 0.5), 2.8);
+        glow += (uCyan * 0.55 + uMagenta * 0.85) * dust * 0.048 * horizon;
         vec3 c = uVoid + glow;
         float vignette = 0.9 + 0.1 * (1.0 - length(vec2(vDir.x, vDir.z)));
         gl_FragColor = vec4(c * vignette, 1.0);
@@ -2605,8 +3330,8 @@ function createMusicBackdrop() {
   skyMesh.renderOrder = -500;
   musicBackdropGroup.add(skyMesh);
 
-  const gridW = mobilePerf ? 200 : 260;
-  const gridD = mobilePerf ? 320 : 400;
+  const gridW = mobilePerf ? 220 : 290;
+  const gridD = mobilePerf ? 350 : 440;
   const floorGeo = new THREE.PlaneGeometry(gridW, gridD, 1, 1);
   musicGridFloorMaterial = makeNeonGridShaderMaterial(false);
   const floor = new THREE.Mesh(floorGeo, musicGridFloorMaterial);
@@ -2622,20 +3347,20 @@ function createMusicBackdrop() {
   ceil.renderOrder = -480;
   musicBackdropGroup.add(ceil);
 
-  const starN = mobilePerf ? 48 : 110;
+  const starN = mobilePerf ? 92 : 198;
   const starPos = new Float32Array(starN * 3);
   for (let i = 0; i < starN; i++) {
-    starPos[i * 3] = (Math.random() - 0.5) * 140;
-    starPos[i * 3 + 1] = Math.random() * 36 + 4;
-    starPos[i * 3 + 2] = 18 + Math.random() * 95;
+    starPos[i * 3] = (Math.random() - 0.5) * 168;
+    starPos[i * 3 + 1] = Math.random() * 40 + 3;
+    starPos[i * 3 + 2] = 14 + Math.random() * 112;
   }
   const starGeo = new THREE.BufferGeometry();
   starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
   musicStarsMaterial = new THREE.PointsMaterial({
-    color: 0xff9ef8,
-    size: mobilePerf ? 0.14 : 0.18,
+    color: 0xffb8fc,
+    size: mobilePerf ? 0.17 : 0.22,
     transparent: true,
-    opacity: 0.86,
+    opacity: 0.92,
     sizeAttenuation: true,
     depthWrite: false,
     fog: false,
@@ -2650,7 +3375,8 @@ function createMusicBackdrop() {
 
 function updateMusicReactiveVisuals(dt) {
   if (!graphicsInited || !musicBackdropGroup || !camera) return;
-  musicPulseTime += dt;
+  const back = isRunningBackward();
+  musicPulseTime += dt * (back ? -1 : 1);
   const pz = playerGroup ? playerGroup.position.z : 0;
   musicBackdropGroup.position.set(0, 0, pz);
   musicBackdropGroup.updateMatrixWorld(true);
@@ -2663,7 +3389,8 @@ function updateMusicReactiveVisuals(dt) {
   const bass = bgmEaseBass;
   const mid = bgmEaseMid;
   const high = bgmEaseHigh;
-  const aliveBoost = alive ? 1 : 0.4;
+  /** Menu: richer sky/grid without BGM; game-over overlay: keep calmer. */
+  const aliveBoost = alive ? 1 : gameStarted ? 0.4 : 0.84;
   const colorK = 1 - Math.exp(-dt * 2.4);
 
   if (musicSkyMaterial) {
@@ -2695,6 +3422,12 @@ function updateMusicReactiveVisuals(dt) {
     runwaySlabMat.uniforms.uMagenta.value.copy(musicSkyMaterial.uniforms.uMagenta.value);
     runwaySlabMat.uniforms.uVoid.value.copy(musicSkyMaterial.uniforms.uVoid.value);
   }
+  if (runwaySlabMat?.uniforms?.uFogNear && scene?.fog?.isFog) {
+    const f = scene.fog;
+    runwaySlabMat.uniforms.uFogNear.value = f.near;
+    runwaySlabMat.uniforms.uFogFar.value = f.far;
+    runwaySlabMat.uniforms.uFogColor.value.copy(f.color);
+  }
 
   if (musicGridFloorMaterial) {
     musicGridFloorMaterial.uniforms.uTime.value = musicPulseTime;
@@ -2712,7 +3445,12 @@ function updateMusicReactiveVisuals(dt) {
   if (runwaySlabMat?.uniforms) {
     runwaySlabMat.uniforms.uScroll.value = distance;
     runwaySlabMat.uniforms.uTime.value = musicPulseTime;
-    runwaySlabMat.uniforms.uPulse.value = bass * aliveBoost;
+    const pulseTarget = !gameStarted
+      ? 0.18 + 0.11 * (0.5 + 0.5 * Math.sin(musicPulseTime * 1.05))
+      : bass * aliveBoost;
+    const pulseK = 1 - Math.exp(-dt * (!gameStarted ? 2.2 : 5.5));
+    runwaySlabPulseEased = THREE.MathUtils.lerp(runwaySlabPulseEased, pulseTarget, pulseK);
+    runwaySlabMat.uniforms.uPulse.value = runwaySlabPulseEased;
     if (camera && runwaySlabMat.uniforms.uCamPos) {
       runwaySlabMat.uniforms.uCamPos.value.copy(camera.position);
     }
@@ -2748,12 +3486,12 @@ function updateMusicReactiveVisuals(dt) {
   }
 
   if (musicStarsMaterial) {
-    const starT = (mobilePerf ? 0.14 : 0.18) + high * 0.06 * aliveBoost + bass * 0.03;
+    const starT = (mobilePerf ? 0.17 : 0.22) + high * 0.06 * aliveBoost + bass * 0.03;
     musicStarsMaterial.size = THREE.MathUtils.lerp(musicStarsMaterial.size, starT, 1 - Math.exp(-dt * 3.5));
   }
 
-  runwayLanePulse = Math.max(0, runwayLanePulse - dt * 2.75);
-  runwayFootFlash *= Math.exp(-dt * 5.4);
+  runwayLanePulse = Math.max(0, runwayLanePulse - dt * 1.85);
+  runwayFootFlash *= Math.exp(-dt * 3.25);
   if (runwayFootFlash < 0.003) runwayFootFlash = 0;
   const rp = runwayLanePulse * runwayLanePulse;
   if (runwaySlabMat?.uniforms?.uImpact) {
@@ -2771,9 +3509,10 @@ function init() {
   scene.fog = new THREE.Fog(0x281845, 32, 108);
   scene.userData.musicFogBase = new THREE.Color(scene.fog.color.getHex());
 
-  camera = new THREE.PerspectiveCamera(58, 1, 0.1, 200);
+  camera = new THREE.PerspectiveCamera(CAMERA_FOV_GAMEPLAY, 1, 0.1, 520);
   // Player runs toward +Z; camera stays behind (-Z) and looks ahead (+Z).
   camera.position.set(0, CAM_Y_AT_REST, -CAM_GAME_Z_OFFSET);
+  cameraGameplayBasePos.copy(camera.position);
   camera.lookAt(0, CAM_LOOK_Y_AT_REST * 0.76, 10);
 
   mobilePerf = preferMobilePerf();
@@ -2824,6 +3563,7 @@ function init() {
   let zEnd = 0;
   const initialChunks = mobilePerf ? 4 : 6;
   for (let i = 0; i < initialChunks; i++) zEnd = spawnChunk(zEnd);
+  ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
 
   playerGroup = makeBlockPlayer();
   playerGroup.position.set(0, 0, 0);
@@ -2889,18 +3629,23 @@ function shiftLane(dir) {
   targetLaneX = laneX(playerLane);
 }
 
+/** When running backward (facing camera), invert lane strafe so screen-left still feels correct. */
+function shiftLaneFromInput(dir) {
+  shiftLane(isRunningBackward() ? -dir : dir);
+}
+
 function onKeyDown(e) {
   if (!gameStarted) return;
   unlockBgm();
   // Screen-left / screen-right match world X when camera is behind the runner (+Z forward).
   if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
     e.preventDefault();
-    shiftLane(1);
+    shiftLaneFromInput(1);
     return;
   }
   if (e.code === 'ArrowRight' || e.code === 'KeyD') {
     e.preventDefault();
-    shiftLane(-1);
+    shiftLaneFromInput(-1);
     return;
   }
   if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
@@ -2912,14 +3657,15 @@ function onKeyDown(e) {
   if (e.code === 'ArrowDown' || e.code === 'KeyS') {
     if (!alive || !runGameplayActive) return;
     e.preventDefault();
-    duckHeld = true;
+    if (e.repeat) return;
+    runBackwardHeld = true;
   }
 }
 
 function onKeyUp(e) {
   if (!gameStarted) return;
   if (e.code === 'ArrowDown' || e.code === 'KeyS') {
-    duckHeld = false;
+    runBackwardHeld = false;
   }
 }
 
@@ -2933,9 +3679,15 @@ function updatePointerLaneFromCanvasX(clientX) {
   if (rect.width <= 0) return;
   const u = (clientX - rect.left) / rect.width;
   let want;
-  if (u < MOUSE_LANE_LEFT_MAX) want = 1;
-  else if (u > MOUSE_LANE_RIGHT_MIN) want = -1;
-  else want = 0;
+  if (isRunningBackward()) {
+    if (u < MOUSE_LANE_LEFT_MAX) want = -1;
+    else if (u > MOUSE_LANE_RIGHT_MIN) want = 1;
+    else want = 0;
+  } else {
+    if (u < MOUSE_LANE_LEFT_MAX) want = 1;
+    else if (u > MOUSE_LANE_RIGHT_MIN) want = -1;
+    else want = 0;
+  }
   if (want !== playerLane) {
     playerLane = want;
     targetLaneX = laneX(playerLane);
@@ -2975,11 +3727,11 @@ function onPointerMove(e) {
   const TOUCH_DRAG_LANE_PX = 72;
   mouseLaneAccum += e.movementX;
   if (mouseLaneAccum >= TOUCH_DRAG_LANE_PX) {
-    shiftLane(-1);
+    shiftLaneFromInput(1);
     mouseLaneAccum = 0;
     didDragLaneChange = true;
   } else if (mouseLaneAccum <= -TOUCH_DRAG_LANE_PX) {
-    shiftLane(1);
+    shiftLaneFromInput(-1);
     mouseLaneAccum = 0;
     didDragLaneChange = true;
   }
@@ -2998,7 +3750,7 @@ function onPointerUp(e) {
   const dy = e.clientY - pointerDownY;
   const swipePx = 24;
   if (!didDragLaneChange && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > swipePx) {
-    shiftLane(dx > 0 ? -1 : 1);
+    shiftLaneFromInput(dx > 0 ? -1 : 1);
   } else if (!didDragLaneChange) {
     tryJump();
   }
@@ -3019,10 +3771,12 @@ function onPointerCancel(e) {
 
 function restart() {
   unlockBgm();
+  clearLobbyBackdropDecor();
   overlay?.classList.add('hidden');
   alive = true;
   speed = baseSpeed;
   distance = 0;
+  furthestDistance = 0;
   coinCount = 0;
   playerLane = 0;
   targetLaneX = 0;
@@ -3052,6 +3806,7 @@ function restart() {
   let zEnd = 0;
   const restartChunks = mobilePerf ? 4 : 6;
   for (let i = 0; i < restartChunks; i++) zEnd = spawnChunk(zEnd);
+  ensureRunwayExtendsTo(RUNWAY_TAIL_TARGET_Z);
 
   overlayAnimGeneration += 1;
   if (overlayStatsEl) overlayStatsEl.classList.remove('stats-enter');
@@ -3063,21 +3818,30 @@ function restart() {
   if (bgmAudio) bgmAudio.playbackRate = BGM_RATE_MIN;
   pendingLandSfx = false;
   difficultyRampT = 0;
+  tunnelRunLightEase = 0;
+  if (runwaySlabMat?.uniforms?.uTunnelFloorBright) runwaySlabMat.uniforms.uTunnelFloorBright.value = 0;
   runwayLanePulse = 0;
   runwayFootFlash = 0;
+  runwaySlabPulseEased = 0;
   runFootPhase = 0;
   lastRunFootSin = 1;
   skipNextFootstepDetect = false;
   landShakeMag = 0;
+  if (camera) cameraGameplayBasePos.copy(camera.position);
   if (runwaySlabMat?.uniforms?.uImpact) runwaySlabMat.uniforms.uImpact.value = 0;
   if (runwaySlabMat?.uniforms?.uFootFlash) runwaySlabMat.uniforms.uFootFlash.value = 0;
   if (runAudio) runAudio.pause();
-  duckHeld = false;
+  runBackwardHeld = false;
+  runBackwardPrevTick = false;
   duckAmount = 0;
   if (playerGroup) {
     playerGroup.userData.duckAmount = 0;
     if (playerGroup.userData.visualRoot) {
-      playerGroup.userData.visualRoot.userData.duckBlend = 0;
+      const vr = playerGroup.userData.visualRoot;
+      vr.userData.duckBlend = 0;
+      vr.rotation.y = PLAYER_RUN_FORWARD_Y;
+    } else {
+      playerGroup.rotation.y = 0;
     }
   }
   runGameplayActive = true;
@@ -3142,6 +3906,22 @@ function overlapsObstacle(rect, o) {
   return !(top < obsBot || foot > obsTop + 0.05);
 }
 
+function decayLandShake(dt) {
+  landShakePhase += dt * 52;
+  landShakeMag *= Math.exp(-dt * 10.5);
+}
+
+function applyLandShakeToCamera() {
+  if (!camera) return;
+  camera.position.copy(cameraGameplayBasePos);
+  if (landShakeMag > 0.006) {
+    const s = landShakeMag;
+    camera.position.y += s * 0.09 * Math.sin(landShakePhase);
+    camera.position.x += s * 0.042 * Math.sin(landShakePhase * 1.67 + 0.8);
+    camera.position.z += s * 0.025 * Math.cos(landShakePhase * 2.05);
+  }
+}
+
 function tick(dt) {
   if (!gameStarted || !alive) return;
   if (!runGameplayActive) return;
@@ -3164,7 +3944,21 @@ function tick(dt) {
     powerSpeedRemain = Math.max(0, powerSpeedRemain - dt);
     travelSpeed *= POWER_SPEED_MULT;
   }
-  distance += travelSpeed * dt;
+  const backward = isRunningBackward();
+  const suppressForwardSlip =
+    !backward &&
+    runBackwardPrevTick &&
+    distance + 1e-4 < furthestDistance;
+  const stepSign = backward ? -1 : suppressForwardSlip ? 0 : 1;
+  distance += stepSign * travelSpeed * dt;
+  runBackwardPrevTick = backward;
+
+  if (distance < 0) distance = 0;
+  const retreatFloor = Math.max(0, furthestDistance - RUN_BACKWARD_MAX_METERS);
+  if (distance < retreatFloor) distance = retreatFloor;
+  if (!backward) {
+    furthestDistance = Math.max(furthestDistance, distance);
+  }
   updateSpeedHud(travelSpeed);
 
   playerGroup.position.x = THREE.MathUtils.lerp(
@@ -3218,7 +4012,7 @@ function tick(dt) {
 
   const onRoofForDuck = isPlayerOnTunnelRoof({ vyMax: 0.06 });
   const grounded = playerY <= 0.035 || onRoofForDuck;
-  const duckTarget = duckHeld && grounded ? 1 : 0;
+  const duckTarget = isRunningBackward() && grounded ? 1 : 0;
   const duckK = duckTarget > duckAmount + 1e-4 ? DUCK_LERP_IN : DUCK_LERP_OUT;
   duckAmount = THREE.MathUtils.lerp(duckAmount, duckTarget, 1 - Math.exp(-dt * duckK));
   if (playerGroup) {
@@ -3247,7 +4041,7 @@ function tick(dt) {
         (powerSpeedRemain > 0 ? 0.26 : 0)) *
       THREE.MathUtils.clamp(travelSpeed / 12, 0.85, 1.38);
     const prevS = lastRunFootSin;
-    runFootPhase += dt * Math.PI * 2 * cadence;
+    runFootPhase += dt * Math.PI * 2 * cadence * (backward ? -1 : 1);
     const s = Math.sin(runFootPhase);
     if (prevS * s < 0) {
       bumpRunwayFootImpact(0.3);
@@ -3257,7 +4051,7 @@ function tick(dt) {
     lastRunFootSin = Math.sin(runFootPhase);
   }
 
-  const runPhase = distance * 0.35;
+  const runPhase = distance * 0.35 * (backward ? -1 : 1);
   const legs = playerGroup.userData.legs;
   if (legs) {
     const swing = Math.sin(runPhase) * 0.35 * (1 - duckAmount * 0.65);
@@ -3275,7 +4069,31 @@ function tick(dt) {
     /** Match foot cycle to world speed: travel can reach ~4× base while old ramp only ~1.6× anim. */
     const speedMul = travelSpeed / Math.max(baseSpeed, 1e-3);
     const curved = Math.pow(speedMul, 0.9);
-    playerRunAction.timeScale = THREE.MathUtils.clamp(curved * 0.98, 0.88, 2.75);
+    let ts = THREE.MathUtils.clamp(curved * 0.98, 0.88, 2.75);
+    if (backward) ts = -ts;
+    playerRunAction.timeScale = ts;
+  }
+
+  const vrRun = playerGroup?.userData?.visualRoot;
+  if (vrRun && alive && runGameplayActive && playerMixer) {
+    const targetY = PLAYER_RUN_FORWARD_Y + (isRunningBackward() ? Math.PI : 0);
+    vrRun.rotation.y = THREE.MathUtils.lerp(
+      vrRun.rotation.y,
+      targetY,
+      1 - Math.exp(-dt * BACKWARD_YAW_LERP),
+    );
+  } else if (
+    playerGroup?.userData?.legs &&
+    !playerGroup.userData.visualRoot &&
+    alive &&
+    runGameplayActive
+  ) {
+    const targetRy = isRunningBackward() ? Math.PI : 0;
+    playerGroup.rotation.y = THREE.MathUtils.lerp(
+      playerGroup.rotation.y,
+      targetRy,
+      1 - Math.exp(-dt * BACKWARD_YAW_LERP),
+    );
   }
 
   if (playerJumpAction && playerJumpAnimOverride && playerMixer) {
@@ -3289,7 +4107,7 @@ function tick(dt) {
   if (vRoot && alive && !playerMixer && playerGroup.userData.gltfStaticPose) {
     const gy = vRoot.userData.groundAlignY ?? vRoot.position.y;
     if (vRoot.userData.groundAlignY == null) vRoot.userData.groundAlignY = vRoot.position.y;
-    const step = distance * 1.22;
+    const step = distance * 1.22 * (isRunningBackward() ? -1 : 1);
     const hop = Math.max(0, Math.sin(step * 2));
     vRoot.rotation.z = Math.sin(step) * 0.12 * (1 - duckAmount * 0.7);
     vRoot.rotation.x = -0.28 - difficultyRampT * 0.16 + duckAmount * 0.55;
@@ -3299,23 +4117,38 @@ function tick(dt) {
   const pz = distance;
   playerGroup.position.z = pz;
 
-  camera.position.z = pz - CAM_GAME_Z_OFFSET;
-  camera.position.x = THREE.MathUtils.lerp(camera.position.x, playerGroup.position.x * 0.35, 0.06);
+  const rect = playerXZRect();
+
+  for (const o of obstacles) {
+    if (o.mesh.position.z < pz - 3) continue;
+    if (overlapsObstacle(rect, o)) {
+      landShakeMag = Math.max(landShakeMag, OBSTACLE_HIT_SHAKE_MAG);
+      landShakePhase = holoTime * 41;
+      alive = false;
+      playGameOverSfx();
+      overlay?.classList.remove('hidden');
+      syncPlayCursor();
+      const metersInt = Math.floor(distance);
+      showGameOverRollup(metersInt, coinCount, calcRunScore(metersInt, coinCount));
+      break;
+    }
+  }
+
+  cameraGameplayBasePos.z = pz - CAM_GAME_Z_OFFSET;
+  cameraGameplayBasePos.x = THREE.MathUtils.lerp(
+    cameraGameplayBasePos.x,
+    playerGroup.position.x * 0.35,
+    0.06,
+  );
   const targetCamY = CAM_Y_AT_REST + playerY * CAM_Y_LIFT_PER_PLAYER_Y;
   cameraSmoothedY = THREE.MathUtils.lerp(
     cameraSmoothedY,
     targetCamY,
     1 - Math.exp(-dt * CAM_Y_SMOOTH_RATE),
   );
-  camera.position.y = cameraSmoothedY;
-  landShakePhase += dt * 52;
-  landShakeMag *= Math.exp(-dt * 10.5);
-  if (landShakeMag > 0.006) {
-    const s = landShakeMag;
-    camera.position.y += s * 0.09 * Math.sin(landShakePhase);
-    camera.position.x += s * 0.042 * Math.sin(landShakePhase * 1.67 + 0.8);
-    camera.position.z += s * 0.025 * Math.cos(landShakePhase * 2.05);
-  }
+  cameraGameplayBasePos.y = cameraSmoothedY;
+  decayLandShake(dt);
+  applyLandShakeToCamera();
   const lookY = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
   camera.lookAt(playerGroup.position.x * 0.4, lookY, pz + 10);
 
@@ -3328,7 +4161,10 @@ function tick(dt) {
     } else if (roll < 0.62) {
       spawnCoinRow(nextSpawnZ + 5);
       nextSpawnZ += 5 + rng() * 7;
-    } else if (roll < 0.685) {
+    } else if (roll < 0.632) {
+      spawnPurpleJumpCoinRow(nextSpawnZ + 5, LANES[Math.floor(rng() * 3)]);
+      nextSpawnZ += 4 + rng() * 6;
+    } else if (roll < 0.697) {
       const zTrail = nextSpawnZ + 6 + rng() * 12;
       spawnPurpleTunnelRoofTrail(zTrail, 38 + rng() * 58);
       nextSpawnZ += 9 + rng() * 10;
@@ -3353,8 +4189,6 @@ function tick(dt) {
     spawnChunk(lastEnd);
   }
 
-  const rect = playerXZRect();
-
   const padHalfW = (LANE_WIDTH * 0.88) / 2;
   const padHalfD = BOOST_PAD_DEPTH / 2;
   for (const pad of boostPads) {
@@ -3371,7 +4205,7 @@ function tick(dt) {
     bumpRunwayFootImpact(0.72);
     skipNextFootstepDetect = true;
     playerVy = BOOST_PAD_VY;
-    playerY = Math.max(playerY, 0.52);
+    playerY = Math.max(playerY, 0.44);
     playerGroup.position.y = playerY;
     speedBoostRemain = BOOST_SPEED_SEC;
     boostRampRemain = Math.max(boostRampRemain, BOOST_PAD_ACCEL_SEC);
@@ -3397,24 +4231,19 @@ function tick(dt) {
     setPadUsedUniform(pad.mesh, 1);
   }
 
-  for (const o of obstacles) {
-    if (o.mesh.position.z < pz - 3) continue;
-    if (overlapsObstacle(rect, o)) {
-      alive = false;
-      playGameOverSfx();
-      overlay?.classList.remove('hidden');
-      syncPlayCursor();
-      const metersInt = Math.floor(distance);
-      showGameOverRollup(metersInt, coinCount, calcRunScore(metersInt, coinCount));
-      break;
-    }
-  }
-
   for (const c of coins) {
     if (c.collected) continue;
     if (Math.abs(c.mesh.position.z - pz) > 0.55) continue;
     if (Math.abs(c.mesh.position.x - playerGroup.position.x) > 0.65) continue;
-    if (c.mega) {
+    if (c.jumpPurple) {
+      const foot = playerY;
+      const top =
+        playerY +
+        THREE.MathUtils.lerp(PLAYER_STAND_TOP, PLAYER_DUCK_TOP, duckAmount);
+      const cy = c.mesh.position.y;
+      const r = PURPLE_JUMP_COIN_HIT_R;
+      if (top < cy - r || foot > cy + r) continue;
+    } else if (c.mega) {
       const { roofTopY } = tunnelGeomConsts();
       if (playerY < roofTopY - 0.2) continue;
     }
@@ -3494,15 +4323,30 @@ function tick(dt) {
       }
     }
   }
+
+  syncTunnelNeonUniforms(dt);
 }
 
 let last = performance.now();
 function loop(now) {
   if (!graphicsInited || !renderer) return;
+  if (gameStarted) stopLobbyRenderLoop();
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   holoTime += dt;
+  const wasAliveBeforeTick = alive;
   tick(dt);
+  if (gameStarted && !alive && !wasAliveBeforeTick) {
+    if (landShakeMag > 0.006) {
+      decayLandShake(dt);
+    } else {
+      landShakeMag = 0;
+    }
+    applyLandShakeToCamera();
+    const pzDead = distance;
+    const lookYDead = CAM_LOOK_Y_AT_REST + playerY * CAM_LOOK_LIFT_PER_PLAYER_Y;
+    camera.lookAt(playerGroup.position.x * 0.4, lookYDead, pzDead + 10);
+  }
   if (gameStarted && alive && !runGameplayActive && introCameraActive) {
     introCameraElapsed += dt;
     updateIntroCamera();
@@ -3510,7 +4354,7 @@ function loop(now) {
   if (playerRunAction && gameStarted && !alive) playerRunAction.timeScale = 0;
   if (playerMixer) playerMixer.update(dt);
   updateBgmPlayback(dt);
-  updateRunSfx();
+  updateRunSfx(dt);
   updateMusicReactiveVisuals(dt);
   syncHologramTimeUniforms(holoTime);
   renderer.render(scene, camera);
@@ -3551,20 +4395,29 @@ async function preloadAudioPipeline() {
 }
 
 /**
- * Create WebGL context, scene, and meshes only after user gesture; warm up shaders so the first
- * playable frame does not freeze mobile Safari/Chrome.
+ * Create WebGL context, scene, and meshes. Cached so the lobby loader and Play tap never load the player twice.
  */
 async function preloadGraphicsPipeline() {
   await new Promise((r) => requestAnimationFrame(r));
   init();
   onResize();
-  await Promise.all([loadAndApplyPlayerCharacter(), loadCoinPrefab()]);
-  if (typeof renderer.compile === 'function') {
-    renderer.compile(scene, camera);
+  if (!graphicsLoadPromise) {
+    graphicsLoadPromise = (async () => {
+      await Promise.all([loadAndApplyPlayerCharacter(), loadCoinPrefab()]);
+      if (typeof renderer.compile === 'function') {
+        renderer.compile(scene, camera);
+      }
+      for (let i = 0; i < 3; i += 1) {
+        renderer.render(scene, camera);
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+    })();
   }
-  for (let i = 0; i < 3; i += 1) {
-    renderer.render(scene, camera);
-    await new Promise((r) => requestAnimationFrame(r));
+  try {
+    await graphicsLoadPromise;
+  } catch (err) {
+    graphicsLoadPromise = null;
+    throw err;
   }
 }
 
@@ -3574,15 +4427,23 @@ function wireStartScreen() {
     if (gameStarted) return;
     primeBgmAudioContext();
     startBtnEl.disabled = true;
-    if (startStatusEl) startStatusEl.textContent = 'Loading 3D engine and audio…';
     try {
-      await Promise.all([preloadAudioPipeline(), preloadGraphicsPipeline()]);
+      if (!lobbyGraphicsReady) {
+        if (startStatusEl) startStatusEl.textContent = 'Loading 3D engine and audio…';
+        await Promise.all([preloadAudioPipeline(), preloadGraphicsPipeline()]);
+        if (!gameStarted) {
+          startLobbyStretchPresentation();
+          startLobbyRenderLoop();
+        }
+      } else {
+        if (startStatusEl) startStatusEl.textContent = 'Loading audio…';
+        await preloadAudioPipeline();
+      }
       initCoinAudioPool();
       gameStarted = true;
       unlockBgm();
-      startScreenEl.classList.add('hidden');
       if (startStatusEl) startStatusEl.textContent = '';
-      syncPlayCursor();
+      beginInitialIntroOrRun();
       last = performance.now();
       requestAnimationFrame(loop);
     } catch (err) {
@@ -3597,5 +4458,25 @@ function wireStartScreen() {
   });
 }
 
+function wireStartInstructions() {
+  startInstructionsBtn?.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openStartInstructionsModal();
+  });
+  startInstructionsCloseBtn?.addEventListener('click', () => closeStartInstructionsModal());
+  startInstructionsDismissBtn?.addEventListener('click', () => closeStartInstructionsModal());
+  document.addEventListener('keydown', (e) => {
+    if (e.code !== 'Escape') return;
+    const m = document.getElementById('start-instructions-modal');
+    if (!m || m.classList.contains('hidden')) return;
+    e.preventDefault();
+    closeStartInstructionsModal();
+    startInstructionsBtn?.focus();
+  });
+}
+
 wireStartScreen();
+wireStartInstructions();
+void bootstrapLobbyGraphics();
 syncPlayCursor();

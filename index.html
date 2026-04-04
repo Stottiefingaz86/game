@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Subway Blocks — Three.js</title>
+    <title>AstroRun — Three.js</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -14,14 +14,57 @@
   </head>
   <body>
     <div id="start-screen">
-      <div class="start-card">
-        <h1 class="start-title">Subway Blocks</h1>
-        <p class="start-lead">
-          Tap Play once: the 3D world and audio load together, then the game starts. This avoids mobile browser stutter from
-          starting WebGL before you&rsquo;re ready.
-        </p>
-        <p id="start-status" class="start-status" aria-live="polite"></p>
-        <button type="button" id="start-btn">Play</button>
+      <div class="start-brand">
+        <p class="start-eyebrow">Endless runner</p>
+        <h1 class="start-logo">AstroRun</h1>
+      </div>
+      <div id="start-panel-load" class="start-panel start-panel--main">
+        <div class="start-card start-card--enter">
+          <p class="start-tagline">
+            Tap Play to start. The runner appears in 3D when loading finishes.
+          </p>
+          <p id="start-status" class="start-status" aria-live="polite"></p>
+          <div class="start-actions">
+            <button type="button" id="start-btn" class="start-play-btn">Play</button>
+            <button type="button" id="start-instructions-btn" class="start-secondary-btn">
+              Instructions
+            </button>
+          </div>
+        </div>
+      </div>
+      <div id="start-panel-warm" class="start-panel start-panel--warm hidden">
+        <div class="start-card start-card--warm">
+          <p id="start-warm-line" class="start-warm-line">Warming up</p>
+        </div>
+      </div>
+    </div>
+    <div
+      id="start-instructions-modal"
+      class="start-instructions-modal hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="start-instructions-heading"
+      aria-hidden="true"
+    >
+      <button
+        type="button"
+        class="start-instructions-backdrop"
+        id="start-instructions-dismiss"
+        tabindex="-1"
+        aria-label="Close instructions"
+      ></button>
+      <div class="start-instructions-panel">
+        <h2 id="start-instructions-heading" class="start-instructions-heading">How to play</h2>
+        <ul class="start-instructions-list">
+          <li><strong>Lanes:</strong> ← → or A D · mouse left / center / right</li>
+          <li><strong>Jump:</strong> space / up / W · click / tap (mobile)</li>
+          <li><strong>Backward:</strong> S or ↓ (max 10 m behind best distance; release to run forward)</li>
+          <li><strong>Duck:</strong> auto while holding backward on the ground — slip under low beams</li>
+          <li><strong>Score:</strong> coins × meters</li>
+        </ul>
+        <button type="button" id="start-instructions-close" class="start-secondary-btn start-instructions-close-btn">
+          Close
+        </button>
       </div>
     </div>
     <div id="ui">
@@ -45,7 +88,7 @@
       </div>
       <div id="overlay" class="hidden">
         <div class="overlay-inner">
-          <h1 class="overlay-title">wipeout</h1>
+          <h1 class="overlay-title overlay-title--game-name">AstroRun</h1>
           <div id="overlay-stats" class="overlay-stats">
             <div class="overlay-stat">
               <span class="overlay-label">meters run</span>
@@ -65,7 +108,7 @@
         </div>
       </div>
       <div id="hint">
-        ← → or A D · mouse left / center / right for lanes · swipe · click = jump · S or ↓ hold = slide / duck under beams
+        ← → or A D · mouse left / center / right for lanes · swipe · click = jump · S or ↓ = run backward (max 10 m behind your best forward distance; face cam, music & run SFX very slow) + duck under beams — release ↓ to go forward again
       </div>
     </div>
     <canvas id="c"></canvas>
